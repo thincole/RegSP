@@ -1,0 +1,21 @@
+# File chi o may chu (khong day len GitHub)
+day-code-github.bat
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Logs & Runtime state
+logs/
+*.log
+.installed
+.env
+settings.json
+service_account.json
+
+# Archives & Temp files
+*.rar
+*.zip
+*.7z
+*.tmp
