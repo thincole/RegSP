@@ -98,6 +98,10 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
                     parsed['fb_password'],
                     parsed.get('fb_2fa_secret', ''),
                     "" if fb_no_cookie else parsed.get('fb_cookie', ''),
+                    parsed.get('hotmail_email', ''),
+                    parsed.get('hotmail_password', ''),
+                    parsed.get('recovery_email', ''),
+                    new_hotmail_pass,
                 )
             except BrowserClosedError:
                 raise

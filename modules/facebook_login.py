@@ -2,7 +2,9 @@
 Bước 1: Tự động đăng nhập Facebook trên Tab 1.
 Phải thành công mới được chuyển sang bước tiếp theo.
 """
+import re
 import time
+import requests
 
 from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.common.by import By
@@ -619,7 +621,263 @@ def _wait_for_fb_captcha(driver: WebDriver, timeout: int = None) -> None:
         logger.debug(f"Lỗi kiểm tra captcha: {e}")
 
 
-def _import_facebook_cookie(driver: WebDriver, fb_cookie: str) -> str:
+def _handle_checkpoint_956(
+    driver: WebDriver,
+    hotmail_email: str = "",
+    hotmail_password: str = "",
+    recovery_email: str = "",
+    new_hotmail_pass: str = "",
+) -> bool:
+    """
+    Tự động mở khóa màn hình khóa tài khoản 'confirm this is your Meta Account to unlock it'
+    (facebook.com/checkpoint/828281030927956):
+      1. Bấm 'Get started' ('Bắt đầu').
+      2. Bấm 'Get a code by email' ('Nhận mã qua email').
+      3. Nếu chưa cài Forwarding cho Hotmail -> tự động đăng nhập Hotmail & cài Forwarding về @nguyenmaucole.io.vn.
+      4. Chọn email radio và bấm 'Next' để gửi mã xác nhận về email.
+      5. Đọc mã 6–8 số từ @nguyenmaucole.io.vn, điền mã và bấm 'Next'.
+      6. Đặt mật khẩu mới ('Khoa01@@c') tại màn hình 'Now, create a new password' và bấm 'Save changes'.
+    """
+    cur_url = (driver.current_url or "").lower()
+    if "828281030927956" not in cur_url:
+        return False
+
+    logger.info("🔓 Phát hiện checkpoint 828281030927956 ('confirm this is your Meta Account to unlock it') -> Tự động mở khóa...")
+    fb_handle = driver.current_window_handle
+    prefix = hotmail_email.split("@")[0].strip().lower() if hotmail_email and "@" in hotmail_email else ""
+    new_fb_pass = new_hotmail_pass or getattr(config, "NEW_HOTMAIL_PASSWORD", "Khoa01@@c")
+
+    driver.implicitly_wait(0)
+    try:
+        # Bước 1: Bấm 'Get started' / 'Bắt đầu' / 'Next' (nếu có)
+        for _ in range(3):
+            get_started_xp = (
+                "//*[@role='button' or self::button or self::a]["
+                "contains(translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'get started') "
+                "or contains(normalize-space(), 'Bắt đầu') "
+                "or normalize-space()='Next' or normalize-space()='Tiếp'"
+                "]"
+            )
+            btns = [e for e in driver.find_elements(By.XPATH, get_started_xp) if e.is_displayed()]
+            if not btns:
+                break
+            btn_txt = (btns[0].text or btns[0].get_attribute("aria-label") or "Get started").strip()
+            # Nếu đã tới bước chọn phương thức liên hệ (có radio button) thì dừng vòng lặp bước 1
+            if driver.find_elements(By.CSS_SELECTOR, "input[type='radio']"):
+                break
+            logger.info(f"Bấm nút '{btn_txt}' trên màn hình mở khóa 956...")
+            if not safe_click(btns[0], delay=4.0):
+                driver.execute_script("arguments[0].click();", btns[0])
+                time.sleep(4.0)
+
+        # Bước 2: Bấm 'Get a code by email' / 'Nhận mã qua email'
+        email_opt_xp = (
+            "//*[@role='button' or self::button]["
+            "contains(translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'get a code by email') "
+            "or contains(normalize-space(), 'Nhận mã qua email') "
+            "or contains(translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'code by email')"
+            "]"
+        )
+        email_opts = [e for e in driver.find_elements(By.XPATH, email_opt_xp) if e.is_displayed()]
+        if email_opts:
+            logger.info("Chọn phương thức 'Get a code by email'...")
+            if not safe_click(email_opts[0], delay=4.0):
+                driver.execute_script("arguments[0].click();", email_opts[0])
+                time.sleep(4.0)
+
+        # Bước 3: Trước khi bấm 'Next' gửi mã về Hotmail, đảm bảo Hotmail đã được cài đặt Forwarding về @nguyenmaucole.io.vn
+        if prefix and hotmail_password:
+            from modules.hotmail_login import (
+                TEMPMAIL_API_URL,
+                TEMPMAIL_DOMAIN,
+                login_hotmail,
+                replace_hotmail_recovery_email,
+                setup_hotmail_forwarding,
+            )
+            from modules.change_password import change_hotmail_password
+
+            logger.info(f"Đảm bảo Hotmail ({hotmail_email}) đã đăng nhập & cài Forwarding trước khi nhận mã mở khóa FB...")
+            driver.implicitly_wait(5)
+            try:
+                hot_ok = login_hotmail(driver, hotmail_email, hotmail_password, recovery_email, new_fb_pass)
+                if hot_ok:
+                    replace_hotmail_recovery_email(driver, hotmail_email, recovery_email, hotmail_password, new_fb_pass)
+                    change_hotmail_password(
+                        driver,
+                        hotmail_password,
+                        new_fb_pass,
+                        hotmail_email,
+                        f"{prefix}@{TEMPMAIL_DOMAIN}",
+                    )
+                    setup_hotmail_forwarding(
+                        driver,
+                        hotmail_email,
+                        f"{prefix}@{TEMPMAIL_DOMAIN}",
+                        new_fb_pass,
+                        hotmail_password,
+                    )
+            except Exception as e:
+                logger.warning(f"Cảnh báo khi chuẩn bị Hotmail cho 956 unlock: {e}")
+            finally:
+                driver.switch_to.window(fb_handle)
+                driver.implicitly_wait(0)
+                time.sleep(1.5)
+
+        # Lấy min_id hiện tại trên tempmail để chỉ bắt thư mới gửi tới
+        min_id = 0
+        if prefix:
+            from modules.hotmail_login import TEMPMAIL_API_URL, TEMPMAIL_DOMAIN
+            try:
+                r0 = requests.get(TEMPMAIL_API_URL, params={"address": f"{prefix}@{TEMPMAIL_DOMAIN}"}, timeout=10)
+                if r0.status_code == 200 and isinstance(r0.json(), list) and r0.json():
+                    min_id = int(r0.json()[0].get("id", 0))
+            except Exception:
+                pass
+
+        # Bước 4: Chọn radio email và bấm 'Next' để gửi mã xác nhận
+        radios = [e for e in driver.find_elements(By.CSS_SELECTOR, "input[type='radio']") if e.is_displayed()]
+        if radios:
+            driver.execute_script("arguments[0].click();", radios[0])
+            time.sleep(1.0)
+            next_btns = [
+                e for e in driver.find_elements(
+                    By.XPATH,
+                    "//*[@role='button' or self::button][normalize-space()='Next' or normalize-space()='Tiếp' or @aria-label='Next' or @aria-label='Tiếp']",
+                )
+                if e.is_displayed()
+            ]
+            if next_btns:
+                logger.info("Đã chọn email và bấm 'Next' gửi mã xác nhận mở khóa FB...")
+                if not safe_click(next_btns[0], delay=4.0):
+                    driver.execute_script("arguments[0].click();", next_btns[0])
+                    time.sleep(4.0)
+
+        # Bước 5: Chờ mã xác nhận Facebook từ @nguyenmaucole.io.vn và điền vào ô code
+        code_inps = [
+            e for e in driver.find_elements(By.CSS_SELECTOR, "input[type='text'], input[type='tel'], input[type='number']")
+            if e.is_displayed()
+        ]
+        if code_inps and prefix:
+            from modules.hotmail_login import TEMPMAIL_API_URL, TEMPMAIL_DOMAIN
+            full_tempmail = f"{prefix}@{TEMPMAIL_DOMAIN}"
+            logger.info(f"Đang chờ mã mở khóa Facebook gửi về {full_tempmail} (tối đa 90s)...")
+            fb_code = None
+            t0 = time.time()
+            while time.time() - t0 < 90:
+                check_browser_alive(driver)
+                try:
+                    resp = requests.get(TEMPMAIL_API_URL, params={"address": full_tempmail}, timeout=10)
+                    if resp.status_code == 200 and isinstance(resp.json(), list):
+                        for m in resp.json():
+                            mid = int(m.get("id", 0))
+                            if mid <= min_id:
+                                continue
+                            subj = str(m.get("subject", "") or "")
+                            frm = str(m.get("from", "") or m.get("sender", "") or "")
+                            body = str(m.get("body_html", "") or m.get("body_text", "") or m.get("body", "") or "")
+                            if "facebook" in (frm + subj + body).lower() or "security" in (subj + body).lower():
+                                clean_b = re.sub(r"<[^>]+>", " ", body)
+                                m_code = re.search(r"\b(\d{6,8})\b", subj) or re.search(r"\b(\d{6,8})\b", clean_b)
+                                if m_code:
+                                    fb_code = m_code.group(1)
+                                    break
+                    if fb_code:
+                        break
+                except Exception:
+                    pass
+                time.sleep(3)
+
+            if not fb_code:
+                logger.error("❌ Không nhận được mã mở khóa Facebook 956 từ email")
+                return False
+
+            logger.info(f"✅ Đã lấy được mã mở khóa Facebook: {fb_code}")
+            safe_send_keys(code_inps[0], fb_code, delay=1.0)
+            next_btns = [
+                e for e in driver.find_elements(
+                    By.XPATH,
+                    "//*[@role='button' or self::button][normalize-space()='Next' or normalize-space()='Tiếp' or @aria-label='Next' or @aria-label='Tiếp']",
+                )
+                if e.is_displayed()
+            ]
+            if next_btns:
+                if not safe_click(next_btns[0], delay=5.0):
+                    driver.execute_script("arguments[0].click();", next_btns[0])
+                    time.sleep(5.0)
+
+        # Bước 6: Xử lý các bước tiếp theo ('Next' -> 'Now, create a new password' -> 'Save changes' -> 'Back to Facebook')
+        for _ in range(8):
+            if "checkpoint" not in (driver.current_url or "").lower():
+                logger.info("✅ Đã mở khóa thành công checkpoint 828281030927956!")
+                return True
+
+            pwd_inps = [
+                e for e in driver.find_elements(By.CSS_SELECTOR, "input[type='password'], input[type='text']")
+                if e.is_displayed()
+            ]
+            body_low = (driver.execute_script("return document.body ? document.body.innerText : '';") or "").lower()
+            if pwd_inps and ("create a new password" in body_low or "new password" in body_low or "mật khẩu mới" in body_low):
+                logger.info(f"Điền mật khẩu mới Facebook trên màn hình mở khóa 956: {new_fb_pass}")
+                safe_send_keys(pwd_inps[0], new_fb_pass, delay=1.0)
+                save_btns = [
+                    e for e in driver.find_elements(
+                        By.XPATH,
+                        "//*[@role='button' or self::button]["
+                        "contains(translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'save changes') "
+                        "or contains(normalize-space(), 'Lưu thay đổi') "
+                        "or normalize-space()='Next' or normalize-space()='Tiếp'"
+                        "]",
+                    )
+                    if e.is_displayed()
+                ]
+                if save_btns:
+                    if not safe_click(save_btns[0], delay=5.0):
+                        driver.execute_script("arguments[0].click();", save_btns[0])
+                        time.sleep(5.0)
+                continue
+
+            action_btns = [
+                e for e in driver.find_elements(
+                    By.XPATH,
+                    "//*[@role='button' or self::button or self::a]["
+                    "normalize-space()='Next' or normalize-space()='Tiếp' "
+                    "or contains(translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'back to facebook') "
+                    "or contains(normalize-space(), 'Quay lại Facebook') "
+                    "or normalize-space()='Continue' or normalize-space()='Tiếp tục'"
+                    "]",
+                )
+                if e.is_displayed()
+            ]
+            if action_btns:
+                if not safe_click(action_btns[0], delay=4.0):
+                    driver.execute_script("arguments[0].click();", action_btns[0])
+                    time.sleep(4.0)
+            else:
+                time.sleep(2.0)
+
+        return "checkpoint" not in (driver.current_url or "").lower()
+    except BrowserClosedError:
+        raise
+    except Exception as e:
+        if is_browser_closed_exception(e):
+            raise BrowserClosedError(f"Trình duyệt đã bị đóng: {e}") from e
+        logger.error(f"Lỗi khi xử lý checkpoint 956: {e}")
+        return False
+    finally:
+        try:
+            driver.implicitly_wait(5)
+        except Exception:
+            pass
+
+
+def _import_facebook_cookie(
+    driver: WebDriver,
+    fb_cookie: str,
+    hotmail_email: str = "",
+    hotmail_password: str = "",
+    recovery_email: str = "",
+    new_hotmail_pass: str = "",
+) -> str:
     """
     Đăng nhập Facebook bằng cách nạp trực tiếp chuỗi Cookie (cơ chế giống hệt extension 'Get Token Cookie'):
     - Xóa toàn bộ cookie facebook.com cũ.
@@ -724,13 +982,15 @@ def _import_facebook_cookie(driver: WebDriver, fb_cookie: str) -> str:
     wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
     time.sleep(2.5)
 
-    # 4. Xử lý cảnh báo hành vi tự động ('Bỏ qua' / 'Dismiss') hoặc popup sau đăng nhập nếu có
+    # 4. Xử lý cảnh báo hành vi tự động ('Bỏ qua' / 'Dismiss'), mở khóa 956 ('Get started'), hoặc popup sau đăng nhập nếu có
     _dismiss_automated_behavior_warning(driver)
+    if "828281030927956" in (driver.current_url or "").lower():
+        _handle_checkpoint_956(driver, hotmail_email, hotmail_password, recovery_email, new_hotmail_pass)
     _handle_post_2fa_prompts(driver)
 
     cur_url = (driver.current_url or "").lower()
-    if "/checkpoint" in cur_url and not _has_c_user_cookie(driver):
-        logger.warning("⚠️ Tài khoản Facebook bị checkpoint ngay sau khi import Cookie — FB die!")
+    if "/checkpoint" in cur_url:
+        logger.warning(f"⚠️ Tài khoản Facebook bị checkpoint ({driver.current_url}) — FB die!")
         return "CHECKPOINT"
 
     if _check_already_logged_in(driver):
@@ -744,6 +1004,8 @@ def _import_facebook_cookie(driver: WebDriver, fb_cookie: str) -> str:
 def login_facebook(
     driver: WebDriver, fb_uid: str, fb_password: str,
     fb_2fa_secret: str = "", fb_cookie: str = "",
+    hotmail_email: str = "", hotmail_password: str = "",
+    recovery_email: str = "", new_hotmail_pass: str = "",
 ) -> bool:
     """
     Đăng nhập Facebook:
@@ -762,13 +1024,18 @@ def login_facebook(
         wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
         time.sleep(2.5)
 
+        if "828281030927956" in (driver.current_url or "").lower():
+            _handle_checkpoint_956(driver, hotmail_email, hotmail_password, recovery_email, new_hotmail_pass)
+
         if _check_already_logged_in(driver):
             logger.info("✅ Facebook đã đăng nhập sẵn trên profile này!")
             return True
 
         # Ưu tiên đăng nhập nhanh bằng Cookie (cơ chế từ extension Get Token Cookie)
         if fb_cookie and "c_user=" in fb_cookie:
-            cookie_status = _import_facebook_cookie(driver, fb_cookie)
+            cookie_status = _import_facebook_cookie(
+                driver, fb_cookie, hotmail_email, hotmail_password, recovery_email, new_hotmail_pass
+            )
             if cookie_status == "SUCCESS":
                 return True
             if cookie_status == "CHECKPOINT":
@@ -835,13 +1102,15 @@ def login_facebook(
                 break
             time.sleep(2)
 
-        # Kiểm tra nhanh cảnh báo hành vi tự động (nếu xuất hiện trễ sau khi vào trang chủ)
+        # Kiểm tra nhanh cảnh báo hành vi tự động hoặc checkpoint 956
         _dismiss_automated_behavior_warning(driver)
+        if "828281030927956" in (driver.current_url or "").lower():
+            _handle_checkpoint_956(driver, hotmail_email, hotmail_password, recovery_email, new_hotmail_pass)
 
         current_url = driver.current_url.lower()
 
-        if "/checkpoint" in current_url and not _has_c_user_cookie(driver):
-            logger.warning("Facebook yêu cầu checkpoint — FB die!")
+        if "/checkpoint" in current_url:
+            logger.warning(f"Facebook yêu cầu checkpoint ({driver.current_url}) — FB die!")
             return False
 
         if _has_c_user_cookie(driver):
