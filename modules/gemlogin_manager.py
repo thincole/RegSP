@@ -10,6 +10,7 @@ Endpoints (tất cả dùng GET):
 Tham khảo: E:\\0- Get Cookie\\getcookies.md
 """
 import io
+import json
 import os
 import re
 import time
@@ -32,6 +33,7 @@ logger = get_logger()
 # API base URL
 API_BASE = f"http://127.0.0.1:{config.GEMLOGIN_API_PORT}"
 _start_profile_lock = threading.Lock()
+_profile_paths: Dict[str, str] = {}
 
 
 def _api_get(endpoint: str, timeout: int = 15) -> dict:
@@ -99,9 +101,13 @@ def find_profile_by_name(profile_name: str) -> str:
                     profiles = res.get("data", [])
                     logger.debug(f"Search API ('{cand}') trả về {len(profiles)} profiles")
                     for profile in profiles:
+                        p_id = str(profile.get("id", ""))
+                        p_path = profile.get("profile_path", "")
+                        if p_id and p_path:
+                            _profile_paths[p_id] = p_path
                         name = profile.get("name", "").strip()
                         if name == cand:
-                            profile_id = str(profile.get("id", ""))
+                            profile_id = p_id
                             if cand != profile_name.strip():
                                 logger.info(
                                     f"Tìm thấy: '{profile_name}' (khớp tên Gemlogin '{cand}') -> ID: {profile_id}"
@@ -120,6 +126,12 @@ def find_profile_by_name(profile_name: str) -> str:
 
         profiles = res.get("data", [])
         logger.info(f"API trả về tổng cộng {len(profiles)} profiles")
+
+        for profile in profiles:
+            p_id = str(profile.get("id", ""))
+            p_path = profile.get("profile_path", "")
+            if p_id and p_path:
+                _profile_paths[p_id] = p_path
 
         # Log vài tên đầu tiên để debug
         if profiles:
@@ -149,6 +161,50 @@ def find_profile_by_name(profile_name: str) -> str:
         raise ProfileNotFoundError(f"Lỗi API khi tìm '{profile_name}': {e}")
 
 
+def _disable_save_password_popup(profile_id: str) -> None:
+    """
+    Tự động tắt hộp thoại 'Save password?' (Offer to save passwords), 'Restore pages?'
+    và cảnh báo lộ mật khẩu trong file Default/Preferences của profile Gemlogin trước khi mở.
+    """
+    profile_path = _profile_paths.get(str(profile_id), "")
+    if not profile_path:
+        default_dir = rf"F:\gemlogin\profiles\{profile_id}"
+        if os.path.isdir(default_dir):
+            profile_path = default_dir
+
+    if not profile_path:
+        return
+
+    pref_dir = os.path.join(os.path.normpath(profile_path), "Default")
+    pref_file = os.path.join(pref_dir, "Preferences")
+    try:
+        os.makedirs(pref_dir, exist_ok=True)
+        prefs = {}
+        if os.path.isfile(pref_file):
+            with open(pref_file, "r", encoding="utf-8") as f:
+                prefs = json.load(f)
+
+        prefs["credentials_enable_service"] = False
+        prefs["credentials_enable_autosignin"] = False
+
+        prof_cfg = prefs.setdefault("profile", {})
+        if isinstance(prof_cfg, dict):
+            prof_cfg["password_manager_enabled"] = False
+            prof_cfg["password_manager_leak_detection"] = False
+            prof_cfg["exit_type"] = "Normal"
+            prof_cfg["exited_cleanly"] = True
+
+        autofill_cfg = prefs.setdefault("autofill", {})
+        if isinstance(autofill_cfg, dict):
+            autofill_cfg["profile_enabled"] = False
+            autofill_cfg["credit_card_enabled"] = False
+
+        with open(pref_file, "w", encoding="utf-8") as f:
+            json.dump(prefs, f, ensure_ascii=False)
+    except Exception as e:
+        logger.debug(f"Không thể cập nhật Preferences cho profile {profile_id}: {e}")
+
+
 @retry(max_retries=2, delay=3.0, exceptions=(ProfileStartError,))
 def start_profile(profile_id: str) -> Dict:
     """
@@ -166,7 +222,11 @@ def start_profile(profile_id: str) -> Dict:
 
     try:
         with _start_profile_lock:
-            res = _api_get(f"/api/profiles/start/{profile_id}", timeout=30)
+            _disable_save_password_popup(profile_id)
+            res = _api_get(
+                f"/api/profiles/start/{profile_id}?addination_args=--disable-save-password-bubble",
+                timeout=30,
+            )
             time.sleep(1.5)
 
         if not res.get("success"):

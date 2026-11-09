@@ -1659,9 +1659,9 @@ def _dismiss_outlook_popups(driver: WebDriver) -> None:
 
             # 1. Ưu tiên bấm nút 'Accept' / 'Accept all' / 'Chấp nhận' trên hộp thoại Privacy/Cookie của Outlook
             accept_xp = (
-                "//button[normalize-space()='Accept' or normalize-space()='Accept all' or normalize-space()='Chấp nhận' "
-                "or .//span[normalize-space()='Accept' or normalize-space()='Accept all' or normalize-space()='Chấp nhận']] | "
-                "//*[@role='button'][normalize-space()='Accept' or normalize-space()='Accept all' or normalize-space()='Chấp nhận']"
+                "//button[normalize-space()='Accept' or normalize-space()='Accept all' or normalize-space()='Chấp nhận' or normalize-space()='Đồng ý' "
+                "or .//*[normalize-space()='Accept' or normalize-space()='Accept all' or normalize-space()='Chấp nhận' or normalize-space()='Đồng ý']] | "
+                "//*[@role='button'][normalize-space()='Accept' or normalize-space()='Accept all' or normalize-space()='Chấp nhận' or normalize-space()='Đồng ý']"
             )
             try:
                 accept_btns = [b for b in driver.find_elements(By.XPATH, accept_xp) if b.is_displayed()]
@@ -1670,18 +1670,16 @@ def _dismiss_outlook_popups(driver: WebDriver) -> None:
                     if not safe_click(btn, delay=1.5):
                         driver.execute_script("arguments[0].click();", btn)
                         time.sleep(1.5)
-                    logger.info("✅ Đã bấm 'Accept' trên thông báo quyền riêng tư Outlook")
+                    logger.info("✅ Đã bấm 'Accept' trên hộp thoại quyền riêng tư Outlook")
                     dismissed = True
                     continue
             except Exception:
                 pass
 
-            # 2. Kiểm tra iframe privacynotice / consent nếu có
+            # 2. Kiểm tra tất cả iframe hiển thị trên trang (bao gồm privacynotice / consent / dialog iframe của Outlook)
             try:
                 iframes = [
-                    f for f in driver.find_elements(
-                        By.CSS_SELECTOR, "iframe[src*='privacynotice'], iframe[src*='consent']"
-                    )
+                    f for f in driver.find_elements(By.TAG_NAME, "iframe")
                     if f.is_displayed()
                 ]
                 for frame in iframes:
@@ -1690,7 +1688,9 @@ def _dismiss_outlook_popups(driver: WebDriver) -> None:
                         btns = driver.find_elements(
                             By.XPATH,
                             "//button[normalize-space()='Accept' or normalize-space()='Accept all' or normalize-space()='OK' "
-                            "or normalize-space()='Next' or normalize-space()='Continue' or normalize-space()='Chấp nhận']",
+                            "or normalize-space()='Next' or normalize-space()='Continue' or normalize-space()='Chấp nhận' or normalize-space()='Đồng ý' "
+                            "or .//*[normalize-space()='Accept' or normalize-space()='Accept all' or normalize-space()='Chấp nhận' or normalize-space()='Đồng ý']] | "
+                            "//*[@role='button'][normalize-space()='Accept' or normalize-space()='Accept all' or normalize-space()='Chấp nhận' or normalize-space()='Đồng ý']",
                         )
                         for b in btns:
                             if b.is_displayed():
@@ -1698,8 +1698,10 @@ def _dismiss_outlook_popups(driver: WebDriver) -> None:
                                     driver.execute_script("arguments[0].click();", b)
                                     time.sleep(1.5)
                                 dismissed = True
-                                logger.info("✅ Đã bấm 'Accept/OK' đóng popup Privacy/Consent trong iframe Outlook")
+                                logger.info("✅ Đã bấm 'Accept/OK' đóng hộp thoại Privacy/Consent trong iframe Outlook")
                                 break
+                    except Exception:
+                        pass
                     finally:
                         driver.switch_to.default_content()
                     if dismissed:
@@ -2049,6 +2051,7 @@ def _ensure_hotmail_logged_in_before_forwarding(
         _handle_microsoft_outlook_landing_page(driver)
 
     if _is_hotmail_already_logged_in(driver):
+        _dismiss_outlook_popups(driver)
         logger.info("✅ Hotmail đã đăng nhập sẵn -> Chuyển thẳng sang Bước 3 (Add mail forwarding)!")
         return True
 
@@ -2240,6 +2243,9 @@ def setup_hotmail_forwarding(
             logger.error("Không tìm thấy nút 'Enable forwarding' trên trang cài đặt Outlook")
             return ""
 
+        # Đóng hộp thoại quyền riêng tư ('Accept') nếu xuất hiện trễ sau khi đăng nhập
+        _dismiss_outlook_popups(driver)
+
         # Kiểm tra công tắc switch đã bật chưa
         switches = driver.find_elements(By.CSS_SELECTOR, "[role='dialog'] input[role='switch'], input[role='switch']")
         is_enabled = False
@@ -2249,11 +2255,15 @@ def setup_hotmail_forwarding(
 
         if not is_enabled:
             if not safe_click(enable_lbl, delay=1.5):
-                driver.execute_script("arguments[0].click();", enable_lbl)
-                time.sleep(1.5)
+                _dismiss_outlook_popups(driver)
+                if not safe_click(enable_lbl, delay=1.5):
+                    driver.execute_script("arguments[0].click();", enable_lbl)
+                    time.sleep(1.5)
             logger.info("Đã bật 'Enable forwarding'")
         else:
             logger.info("'Enable forwarding' đã được bật sẵn")
+
+        _dismiss_outlook_popups(driver)
 
         # Tìm ô nhập 'Forward my email to:'
         fwd_input = wait_for_element(
@@ -2268,11 +2278,15 @@ def setup_hotmail_forwarding(
             return ""
 
         # Xóa nội dung cũ (nếu có) và nhập email @nguyenmaucole.io.vn
-        safe_click(fwd_input, delay=0.3)
+        if not safe_click(fwd_input, delay=0.3):
+            _dismiss_outlook_popups(driver)
+            safe_click(fwd_input, delay=0.3)
         fwd_input.send_keys(Keys.CONTROL + "a")
         fwd_input.send_keys(Keys.BACKSPACE)
         safe_send_keys(fwd_input, forward_email, delay=1.0, clear_first=False)
         logger.info(f"Đã điền email chuyển tiếp: {forward_email}")
+
+        _dismiss_outlook_popups(driver)
 
         # Tích chọn 'Keep a copy of forwarded messages' nếu chưa tích
         try:
@@ -2288,10 +2302,15 @@ def setup_hotmail_forwarding(
                     By.CSS_SELECTOR, "[role='dialog'] input[type='checkbox']:not([role='switch'])"
                 )
                 if keep_cbs and not (keep_cbs[0].is_selected() or keep_cbs[0].get_attribute("checked")):
-                    safe_click(keep_lbl, delay=0.5)
+                    if not safe_click(keep_lbl, delay=0.5):
+                        _dismiss_outlook_popups(driver)
+                        safe_click(keep_lbl, delay=0.5)
                     logger.info("Đã tích 'Keep a copy of forwarded messages'")
         except Exception:
             pass
+
+        # Đóng hộp thoại quyền riêng tư ('Accept') nếu xuất hiện trước khi bấm Save
+        _dismiss_outlook_popups(driver)
 
         # Bấm nút Save (nếu nút Save hiển thị / có thay đổi)
         save_btn = wait_for_element(
@@ -2303,8 +2322,12 @@ def setup_hotmail_forwarding(
         )
         if save_btn:
             if not safe_click(save_btn, delay=3.0):
-                driver.execute_script("arguments[0].click();", save_btn)
-                time.sleep(3.0)
+                # Nếu bị che bởi hộp thoại quyền riêng tư mới hiện lên -> bấm 'Accept' rồi bấm lại 'Save'
+                _dismiss_outlook_popups(driver)
+                if not safe_click(save_btn, delay=3.0):
+                    driver.execute_script("arguments[0].click();", save_btn)
+                    time.sleep(3.0)
+            _dismiss_outlook_popups(driver)
             logger.info("✅ Đã bấm 'Save' lưu cài đặt Forwarding thành công!")
         else:
             logger.info("Cài đặt Forwarding đã được lưu trước đó (không cần bấm Save)")
@@ -2779,6 +2802,8 @@ def login_hotmail(
             and "interrupt/credentialaction" not in cur_lower
             and "identity/confirm" not in cur_lower
         ):
+            if "outlook.live.com" in cur_lower:
+                _dismiss_outlook_popups(driver)
             logger.info("✅ Đăng nhập Hotmail thành công!")
             return True
         else:
