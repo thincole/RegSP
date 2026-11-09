@@ -130,6 +130,10 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
                     parsed['fb_password'],
                     shopee_url,
                     region,
+                    parsed.get('hotmail_email', ''),
+                    parsed.get('hotmail_password', ''),
+                    parsed.get('recovery_email', ''),
+                    new_hotmail_pass,
                 )
             except BrowserClosedError:
                 raise

@@ -358,9 +358,11 @@ def _click_fb_oauth_steps(driver: WebDriver, popup_handle: str) -> bool:
 def _handle_facebook_popup(
     driver: WebDriver, fb_uid: str, fb_password: str,
     handles_before_click: set = None, shopee_handle: str = None,
+    hotmail_email: str = "", hotmail_password: str = "",
+    recovery_email: str = "", new_hotmail_pass: str = "",
 ) -> bool:
     """
-    Xử lý popup Facebook OAuth (consent / đăng nhập).
+    Xử lý popup Facebook OAuth (consent / đăng nhập / mở khóa 956 nếu xuất hiện trong popup).
     Popup hiện nút "Continue as [Name]" — cần click vào đó.
     """
     logger.info("Đang xử lý popup Facebook...")
@@ -406,6 +408,31 @@ def _handle_facebook_popup(
     if fb_popup_handle:
         driver.switch_to.window(fb_popup_handle)
         time.sleep(3)
+
+        # Nếu popup Facebook OAuth bị nhảy vào checkpoint 956 ('confirm this is your Meta Account to unlock it')
+        if "828281030927956" in (driver.current_url or "").lower():
+            from modules.facebook_login import _handle_checkpoint_956
+            unlocked = _handle_checkpoint_956(
+                driver, hotmail_email, hotmail_password, recovery_email, new_hotmail_pass
+            )
+            if unlocked:
+                # Nếu sau khi mở khóa 956, popup chuyển về trang chủ FB thay vì màn hình OAuth consent -> đóng popup & bấm lại nút FB trên Shopee
+                if fb_popup_handle in driver.window_handles:
+                    driver.switch_to.window(fb_popup_handle)
+                    u_after = (driver.current_url or "").lower()
+                    if "oauth" not in u_after and "privacy/consent" not in u_after:
+                        try:
+                            driver.close()
+                        except Exception:
+                            pass
+                        driver.switch_to.window(shopee_handle)
+                        time.sleep(1.5)
+                        handles_retry = set(driver.window_handles)
+                        if _click_facebook_login_button(driver):
+                            return _handle_facebook_popup(
+                                driver, fb_uid, fb_password, handles_retry, shopee_handle,
+                                hotmail_email, hotmail_password, recovery_email, new_hotmail_pass,
+                            )
 
         # Kiểm tra cần nhập credentials không
         email_input = wait_for_element(
@@ -1455,6 +1482,10 @@ def login_shopee_account_via_facebook(
     fb_password: str,
     shopee_url: str,
     region_name: str = "Shopee.PH",
+    hotmail_email: str = "",
+    hotmail_password: str = "",
+    recovery_email: str = "",
+    new_hotmail_pass: str = "",
 ) -> bool:
     """
     Bước 2: Đăng nhập tài khoản Shopee (PH / MY / ID) bằng Facebook.
@@ -1553,7 +1584,10 @@ def login_shopee_account_via_facebook(
                     )
                     need_affiliate_fallback = True
                 else:
-                    if not _handle_facebook_popup(driver, fb_uid, fb_password, handles_before_click, shopee_handle):
+                    if not _handle_facebook_popup(
+                        driver, fb_uid, fb_password, handles_before_click, shopee_handle,
+                        hotmail_email, hotmail_password, recovery_email, new_hotmail_pass,
+                    ):
                         raise LoginFailedError(f"Xử lý popup Facebook thất bại ({region_name})")
 
         if need_affiliate_fallback and affiliate_url:
@@ -1591,7 +1625,10 @@ def login_shopee_account_via_facebook(
                 handles_before_login = set(driver.window_handles)
                 login_handle = driver.current_window_handle
                 if _click_facebook_login_button(driver):
-                    _handle_facebook_popup(driver, fb_uid, fb_password, handles_before_login, login_handle)
+                    _handle_facebook_popup(
+                        driver, fb_uid, fb_password, handles_before_login, login_handle,
+                        hotmail_email, hotmail_password, recovery_email, new_hotmail_pass,
+                    )
 
         time.sleep(2)
         if _is_shopee_phone_verification(driver):

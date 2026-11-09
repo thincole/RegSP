@@ -699,6 +699,8 @@ def _handle_checkpoint_956(
             logger.info(f"Đảm bảo Hotmail ({hotmail_email}) đã đăng nhập & cài Forwarding trước khi nhận mã mở khóa FB...")
             driver.implicitly_wait(5)
             try:
+                if driver.window_handles and fb_handle != driver.window_handles[0]:
+                    driver.switch_to.window(driver.window_handles[0])
                 hot_ok = login_hotmail(driver, hotmail_email, hotmail_password, recovery_email, new_fb_pass)
                 if hot_ok:
                     replace_hotmail_recovery_email(driver, hotmail_email, recovery_email, hotmail_password, new_fb_pass)
