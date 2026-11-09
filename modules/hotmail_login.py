@@ -119,6 +119,86 @@ def _click_sign_in_button(driver: WebDriver) -> bool:
     return False
 
 
+def _handle_microsoft_outlook_landing_page(driver: WebDriver) -> bool:
+    """
+    Xử lý khi trình duyệt bị chuyển hướng sang trang giới thiệu Microsoft 365 Outlook
+    (microsoft.com/.../microsoft-365/outlook/...):
+      1. Tự động bấm 'Accept' trên thanh thông báo Cookie (nếu có).
+      2. Bấm nút 'Sign in' trên thanh điều hướng Outlook để vào đúng luồng đăng nhập OWA.
+      3. Nếu nút 'Sign in' mở tab mới thì chuyển sang tab mới và đóng tab giới thiệu cũ.
+    """
+    current_url = (driver.current_url or "").lower()
+    if "microsoft.com/" not in current_url or "login.live.com" in current_url or "account.microsoft.com" in current_url:
+        return False
+
+    logger.info(f"Phát hiện trang giới thiệu Microsoft 365 Outlook ({current_url[:70]}) -> Xử lý Cookie 'Accept' & 'Sign in'...")
+    driver.implicitly_wait(0)
+    try:
+        # 1. Bấm nút 'Accept' trên thông báo Cookie của Microsoft (nếu có)
+        accept_btns = [
+            b for b in driver.find_elements(
+                By.XPATH,
+                "//button[normalize-space()='Accept' or normalize-space()='Accept all' or normalize-space()='Chấp nhận' "
+                "or .//span[normalize-space()='Accept' or normalize-space()='Accept all' or normalize-space()='Chấp nhận']]",
+            )
+            if b.is_displayed()
+        ]
+        if accept_btns:
+            btn = accept_btns[0]
+            if not safe_click(btn, delay=1.0):
+                driver.execute_script("arguments[0].click();", btn)
+                time.sleep(1.0)
+            logger.info("✅ Đã bấm 'Accept' trên thông báo Cookie của Microsoft")
+
+        # 2. Tìm và bấm nút 'Sign in' trên trang Microsoft 365 Outlook
+        signin_els = [
+            el for el in driver.find_elements(
+                By.XPATH,
+                "//a[normalize-space()='Sign in' or normalize-space()='Đăng nhập' or contains(@data-bi-cn, 'SignIn') or contains(@href, 'fwlink/?linkid=2276500')]"
+                " | //button[normalize-space()='Sign in' or normalize-space()='Đăng nhập']",
+            )
+            if el.is_displayed()
+        ]
+        if signin_els:
+            target = signin_els[0]
+            old_handle = driver.current_window_handle
+            handles_before = set(driver.window_handles)
+            if not safe_click(target, delay=1.5):
+                driver.execute_script("arguments[0].click();", target)
+                time.sleep(1.5)
+            logger.info("✅ Đã bấm nút 'Sign in' trên trang Microsoft 365 Outlook")
+
+            # Chờ tab mới mở ra hoặc URL hiện tại chuyển sang login.live.com / outlook.live.com/mail
+            for _ in range(12):
+                time.sleep(0.5)
+                cur_handles = set(driver.window_handles)
+                diff = cur_handles - handles_before
+                if diff:
+                    new_handle = list(diff)[0]
+                    try:
+                        if old_handle in driver.window_handles and len(driver.window_handles) > 1:
+                            driver.switch_to.window(old_handle)
+                            driver.close()
+                    except Exception:
+                        pass
+                    driver.switch_to.window(new_handle)
+                    break
+                u_now = (driver.current_url or "").lower()
+                if "login.live.com" in u_now or "outlook.live.com/mail" in u_now:
+                    break
+    except Exception as e:
+        logger.debug(f"Lỗi khi xử lý trang Microsoft 365 Outlook landing page: {e}")
+    finally:
+        try:
+            driver.implicitly_wait(5)
+        except Exception:
+            pass
+
+    wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
+    time.sleep(2)
+    return True
+
+
 def _enter_email(driver: WebDriver, email: str) -> bool:
     """Nhập email Hotmail vào trang đăng nhập Microsoft."""
     wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
@@ -130,12 +210,13 @@ def _enter_email(driver: WebDriver, email: str) -> bool:
             logger.info("Tài khoản Hotmail đã đăng nhập sẵn trong profile!")
             return True
 
-    # Nếu bị redirect sang trang quảng cáo Microsoft 365 thay vì form login -> chuyển thẳng tới login.live.com
+    # Nếu bị redirect sang trang quảng cáo Microsoft 365 -> bấm Accept cookie + Sign in
     if "microsoft.com/" in current_url and "login.live.com" not in current_url:
-        logger.info("Trang hiện tại là landing page Microsoft -> Chuyển thẳng tới https://outlook.live.com/owa/?nlp=1 ...")
-        driver.get("https://outlook.live.com/owa/?nlp=1")
-        wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
-        time.sleep(2)
+        _handle_microsoft_outlook_landing_page(driver)
+        current_url = (driver.current_url or "").lower()
+        if "outlook.live.com/mail" in current_url and "login.live.com" not in current_url:
+            logger.info("Tài khoản Hotmail đã đăng nhập sẵn sau khi bấm Sign in!")
+            return True
 
     email_selectors = [
         (By.CSS_SELECTOR, "input[type='email'], #i0116, #usernameEntry, input[name='loginfmt']"),
@@ -1964,6 +2045,9 @@ def _ensure_hotmail_logged_in_before_forwarding(
     wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
     time.sleep(3)
 
+    if "microsoft.com/" in (driver.current_url or "").lower() and "login.live.com" not in (driver.current_url or "").lower():
+        _handle_microsoft_outlook_landing_page(driver)
+
     if _is_hotmail_already_logged_in(driver):
         logger.info("✅ Hotmail đã đăng nhập sẵn -> Chuyển thẳng sang Bước 3 (Add mail forwarding)!")
         return True
@@ -1992,6 +2076,11 @@ def _ensure_hotmail_logged_in_before_forwarding(
         driver.get("https://outlook.live.com/owa/?nlp=1")
         wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
         time.sleep(2)
+        if "microsoft.com/" in (driver.current_url or "").lower() and "login.live.com" not in (driver.current_url or "").lower():
+            _handle_microsoft_outlook_landing_page(driver)
+            if _is_hotmail_already_logged_in(driver):
+                logger.info("✅ Hotmail đã đăng nhập sẵn sau khi bấm Sign in!")
+                return True
 
     # Nếu hiện màn hình 'Pick an account' có sẵn email, bấm vào tài khoản đó; ngược lại nhập email
     clicked_Tile = False
@@ -2080,12 +2169,20 @@ def setup_hotmail_forwarding(
         time.sleep(4)
 
         cur_u = (driver.current_url or "").lower()
+        if "microsoft.com/" in cur_u and "login.live.com" not in cur_u:
+            _handle_microsoft_outlook_landing_page(driver)
+            cur_u = (driver.current_url or "").lower()
+
         if "login." in cur_u or "account.live.com" in cur_u or "privacynotice" in cur_u:
             handle_microsoft_prompts(driver, hotmail_email, recovery_email, current_password=old_hotmail_pass)
             if "outlook.live.com/mail/options/mail/forwarding" not in (driver.current_url or "").lower():
                 driver.get(forwarding_url)
                 wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
                 time.sleep(4)
+        elif "outlook.live.com/mail/options/mail/forwarding" not in cur_u:
+            driver.get(forwarding_url)
+            wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
+            time.sleep(4)
 
         # Đóng các popup xuất hiện lần đầu trên Outlook (nếu có)
         _dismiss_outlook_popups(driver)
@@ -2407,16 +2504,19 @@ def replace_hotmail_recovery_email(
                 driver.execute_script("arguments[0].click();", add_email_opt)
                 time.sleep(2.0)
 
-            # Nhập địa chỉ email mới vào ô #email (AddEmailProofModal)
+            wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
+            time.sleep(1.5)
+
+            # Nhập địa chỉ email mới vào ô #EmailAddress (trang proofs/Add?apt=2) hoặc #email (AddEmailProofModal)
             email_inp = wait_for_element(
                 driver,
                 By.CSS_SELECTOR,
-                "div[data-mp-dialog='AddEmailProofModal'] input#email, input#email, .modal input[type='email']",
-                timeout=8,
+                "#EmailAddress, #iProofEmail, input[name='EmailAddress'], div[data-mp-dialog='AddEmailProofModal'] input#email, input#email, input[type='email']",
+                timeout=10,
                 condition="visible",
             )
             if not email_inp:
-                logger.error("Không tìm thấy ô nhập email khôi phục mới (#email)")
+                logger.error("Không tìm thấy ô nhập email khôi phục mới (#EmailAddress / #email)")
                 return False
 
             min_mail_id = _get_latest_tempmail_id(prefix)
@@ -2436,28 +2536,31 @@ def replace_hotmail_recovery_email(
             next_btn = wait_for_element(
                 driver,
                 By.CSS_SELECTOR,
-                "[data-mp-control='AddEmailProofModal.PrimaryOnNext'], div[data-mp-dialog='AddEmailProofModal'] #iBtn_action, .modal button#iBtn_action",
+                "#iNext, [data-mp-control='AddEmailProofModal.PrimaryOnNext'], div[data-mp-dialog='AddEmailProofModal'] #iBtn_action, input[type='submit'], button[type='submit']",
                 timeout=5,
                 condition="clickable",
             )
             if not next_btn:
-                logger.error("Không tìm thấy nút Next trong hộp thoại AddEmailProofModal")
+                logger.error("Không tìm thấy nút Next khi thêm email khôi phục mới")
                 return False
 
             if not safe_click(next_btn, delay=2.5):
                 driver.execute_script("arguments[0].click();", next_btn)
                 time.sleep(2.5)
 
-            # Chờ ô nhập mã xác minh #ottCode (AddAddressableProofModal)
+            wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
+            time.sleep(1.5)
+
+            # Chờ ô nhập mã xác minh #iOttText (trang proofs/Add) hoặc #ottCode (AddAddressableProofModal)
             ott_inp = wait_for_element(
                 driver,
                 By.CSS_SELECTOR,
-                "div[data-mp-dialog='AddAddressableProofModal'] input#ottCode, input#ottCode, input[name='ottCode']",
+                "#iOttText, input[name='iOttText'], div[data-mp-dialog='AddAddressableProofModal'] input#ottCode, input#ottCode, input[name='ottCode'], input[name='otc'], input[type='tel']",
                 timeout=10,
                 condition="visible",
             )
             if not ott_inp:
-                logger.error("Không tìm thấy ô nhập mã OTP (#ottCode) khi thêm email khôi phục mới")
+                logger.error("Không tìm thấy ô nhập mã OTP (#iOttText / #ottCode) khi thêm email khôi phục mới")
                 return False
 
             code = _fetch_code_from_tempmail(driver, prefix, min_id=min_mail_id, timeout=90)
@@ -2481,7 +2584,7 @@ def replace_hotmail_recovery_email(
             verify_btn = wait_for_element(
                 driver,
                 By.CSS_SELECTOR,
-                "[data-mp-control='AddAddressableProofModal.PrimaryAddProof'], div[data-mp-dialog='AddAddressableProofModal'] #iBtn_action, .modal button#iBtn_action",
+                "#iNext, [data-mp-control='AddAddressableProofModal.PrimaryAddProof'], div[data-mp-dialog='AddAddressableProofModal'] #iBtn_action, input[type='submit'], button[type='submit']",
                 timeout=5,
                 condition="clickable",
             )
@@ -2491,7 +2594,21 @@ def replace_hotmail_recovery_email(
                     time.sleep(3.5)
 
             logger.info(f"✅ Đã thêm thành công email khôi phục mới: {new_rec_email}")
+            wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
             time.sleep(2)
+
+            # Đảm bảo quay về trang Manage/additional để tiếp tục Bước B (xóa email khôi phục cũ)
+            if "proofs/manage" not in (driver.current_url or "").lower():
+                driver.get(manage_url)
+                wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
+                time.sleep(2)
+            wait_for_element(
+                driver,
+                By.CSS_SELECTOR,
+                "#ManageProofs, div[data-mp-proof-type='email']",
+                timeout=10,
+                condition="presence",
+            )
 
         # Bước B: Xóa các email khôi phục cũ (không phải @nguyenmaucole.io.vn)
         for _ in range(5):

@@ -51,30 +51,48 @@ def _handle_reverify(driver: WebDriver, current_password: str, new_password: str
 
 def _click_change_password_link(driver: WebDriver) -> bool:
     """
-    Tìm và click link 'Change password' / 'Thay đổi mật khẩu'.
+    Tìm và click nút/link 'Change password' ngay trên trang account.live.com/proofs/Manage/additional.
     """
     selectors = [
-        (By.ID, "changePasswordLink"),
-        (By.CSS_SELECTOR, "a[href*='password/Change']"),
-        (By.CSS_SELECTOR, "a[href*='password']"),
-        (By.XPATH, "//a[contains(text(), 'Change password')]"),
-        (By.XPATH, "//a[contains(text(), 'Thay đổi mật khẩu')]"),
-        (By.XPATH, "//a[contains(text(), 'change password')]"),
-        (By.XPATH, "//button[contains(text(), 'Change password')]"),
-        (By.XPATH, "//button[contains(text(), 'Thay đổi mật khẩu')]"),
-        (By.CSS_SELECTOR, "a#iChangePassword"),
-        (By.ID, "iChangePassword"),
+        (By.CSS_SELECTOR, "#ChangePassword, button[data-mp-control='PasswordPullout.ChangePassword'], #changePasswordLink, a[href*='password/Change']"),
+        (By.XPATH, "//button[normalize-space()='Change password' or normalize-space()='Thay đổi mật khẩu'] | //a[contains(., 'Change password') or contains(., 'Thay đổi mật khẩu')]"),
     ]
 
     for by, value in selectors:
         link = wait_for_element(driver, by, value, timeout=3, condition="clickable")
         if link:
-            link_text = link.text.strip()
-            logger.info(f"Tìm thấy link đổi mật khẩu: '{link_text}'")
-            if safe_click(link, delay=3.0):
-                return True
+            link_text = (link.text or link.get_attribute("id") or "Change password").strip()
+            logger.info(f"Bấm nút đổi mật khẩu trực tiếp trên trang Manage: '{link_text}'")
+            if not safe_click(link, delay=2.5):
+                driver.execute_script("arguments[0].click();", link)
+                time.sleep(2.5)
+            return True
 
-    logger.error("Không tìm thấy link 'Change password'")
+    # Nếu thẻ Password đang đóng thu gọn thì mở ra rồi bấm #ChangePassword
+    pwd_toggle = wait_for_element(
+        driver,
+        By.CSS_SELECTOR,
+        "#Password a[data-mp-control='Pullout.Toggle'], #Password .pullout-link",
+        timeout=2,
+        condition="clickable",
+    )
+    if pwd_toggle:
+        if not safe_click(pwd_toggle, delay=1.0):
+            driver.execute_script("arguments[0].click();", pwd_toggle)
+            time.sleep(1.0)
+        btn = wait_for_element(
+            driver,
+            By.CSS_SELECTOR,
+            "#ChangePassword, button[data-mp-control='PasswordPullout.ChangePassword']",
+            timeout=3,
+            condition="clickable",
+        )
+        if btn:
+            if not safe_click(btn, delay=2.5):
+                driver.execute_script("arguments[0].click();", btn)
+                time.sleep(2.5)
+            return True
+
     return False
 
 
@@ -180,15 +198,25 @@ def change_hotmail_password(
     logger.info(f"=== BƯỚC 3: Đổi mật khẩu Hotmail → '{new_password}' ===")
 
     try:
-        # Xử lý các prompt còn tồn đọng (Passkey -> Cancel, Stay signed in -> Yes, ...)
-        if hotmail_email or recovery_email:
-            handle_microsoft_prompts(driver, hotmail_email, recovery_email, current_password=current_password)
+        # Nếu trình duyệt đang đứng sẵn ở trang account.live.com/proofs/Manage (sau bước thay mail khôi phục),
+        # bấm trực tiếp nút 'Change password' ngay trên trang để giữ nguyên phiên xác thực (không cần load lại URL mới)
+        cur_url_low = (driver.current_url or "").lower()
+        clicked_on_manage = False
+        if "proofs/manage" in cur_url_low:
+            clicked_on_manage = _click_change_password_link(driver)
+            if clicked_on_manage:
+                wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
+                time.sleep(2)
 
-        # Mở trực tiếp trang đổi mật khẩu để tiết kiệm thời gian
-        logger.info("Mở trang đổi mật khẩu: https://account.live.com/password/Change")
-        driver.get("https://account.live.com/password/Change")
-        wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
-        time.sleep(2)
+        if not clicked_on_manage and "password/change" not in (driver.current_url or "").lower():
+            # Xử lý các prompt còn tồn đọng (Passkey -> Cancel, Stay signed in -> Yes, ...)
+            if hotmail_email or recovery_email:
+                handle_microsoft_prompts(driver, hotmail_email, recovery_email, current_password=current_password)
+
+            logger.info("Mở trang đổi mật khẩu: https://account.live.com/password/Change")
+            driver.get("https://account.live.com/password/Change")
+            wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
+            time.sleep(2)
 
         # Vòng lặp xử lý các bước trung gian (nhập email / xác minh lại mật khẩu / Verify your email / Passkey / Stay signed in)
         # cho đến khi vào được form đổi mật khẩu (có >= 2 ô input[type='password'])

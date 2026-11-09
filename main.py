@@ -144,10 +144,11 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
                 return
             logger.info(f"Dòng {row_index} ({profile_name}): Login tài khoản {region} bằng Facebook thành công.")
 
-        # Bước 3: Login Hotmail và đổi password Hotmail
+        # Bước 3: Login Hotmail -> Thay mail khôi phục (nếu chọn) -> Đổi password Hotmail
         hot_ok = False
         recovery_email = parsed.get('recovery_email', '')
-        if 3 in selected_steps and not stop_flag.is_set():
+        want_change_recovery = bool(gui_config.get('HOTMAIL_CHANGE_RECOVERY', False))
+        if (3 in selected_steps or want_change_recovery) and not stop_flag.is_set():
             check_browser_alive(driver)
             logger.info(f"Dòng {row_index} ({profile_name}): Bắt đầu Bước 3 - Login Hotmail")
             try:
@@ -168,28 +169,9 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
 
             if hot_ok:
                 logger.info(f"Dòng {row_index} ({profile_name}): Login Hotmail thành công.")
-                if not stop_flag.is_set():
-                    check_browser_alive(driver)
-                    logger.info(f"Dòng {row_index} ({profile_name}): Tiến hành đổi mật khẩu Hotmail...")
-                    try:
-                        pwd_ok = change_hotmail_password(
-                            driver, parsed['hotmail_password'], new_hotmail_pass, parsed['hotmail_email'], recovery_email
-                        )
-                    except BrowserClosedError:
-                        raise
-                    except Exception as e:
-                        if is_browser_closed_exception(e):
-                            raise BrowserClosedError(str(e)) from e
-                        logger.error(f"Dòng {row_index} ({profile_name}): Đổi mật khẩu Hotmail lỗi - {e}")
-                        pwd_ok = False
 
-                    if pwd_ok:
-                        logger.info(f"Dòng {row_index} ({profile_name}): Đổi mật khẩu Hotmail thành công.")
-                    else:
-                        logger.error(f"Dòng {row_index} ({profile_name}): Đổi mật khẩu Hotmail thất bại.")
-
-                # Nếu tích chọn "Thay mail khôi phục về @nguyenmaucole.io.vn"
-                if bool(gui_config.get('HOTMAIL_CHANGE_RECOVERY', False)) and not stop_flag.is_set():
+                # 3a. Thay mail khôi phục về @nguyenmaucole.io.vn TRƯỚC (cùng trang account.live.com/proofs/Manage/additional)
+                if want_change_recovery and not stop_flag.is_set():
                     check_browser_alive(driver)
                     logger.info(f"Dòng {row_index} ({profile_name}): Tiến hành kiểm tra / thay mail khôi phục Hotmail về @nguyenmaucole.io.vn...")
                     try:
@@ -214,6 +196,27 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
                         logger.info(f"Dòng {row_index} ({profile_name}): Hoàn tất kiểm tra / thay mail khôi phục Hotmail ({recovery_email}).")
                     else:
                         logger.error(f"Dòng {row_index} ({profile_name}): Thay mail khôi phục Hotmail thất bại.")
+
+                # 3b. Đổi mật khẩu Hotmail SAU (bấm trực tiếp Change password ngay trên trang Security/Manage nếu đang mở sẵn)
+                if 3 in selected_steps and not stop_flag.is_set():
+                    check_browser_alive(driver)
+                    logger.info(f"Dòng {row_index} ({profile_name}): Tiến hành đổi mật khẩu Hotmail...")
+                    try:
+                        pwd_ok = change_hotmail_password(
+                            driver, parsed['hotmail_password'], new_hotmail_pass, parsed['hotmail_email'], recovery_email
+                        )
+                    except BrowserClosedError:
+                        raise
+                    except Exception as e:
+                        if is_browser_closed_exception(e):
+                            raise BrowserClosedError(str(e)) from e
+                        logger.error(f"Dòng {row_index} ({profile_name}): Đổi mật khẩu Hotmail lỗi - {e}")
+                        pwd_ok = False
+
+                    if pwd_ok:
+                        logger.info(f"Dòng {row_index} ({profile_name}): Đổi mật khẩu Hotmail thành công.")
+                    else:
+                        logger.error(f"Dòng {row_index} ({profile_name}): Đổi mật khẩu Hotmail thất bại.")
             else:
                 logger.error(f"Dòng {row_index} ({profile_name}): Login Hotmail thất bại.")
 

@@ -808,8 +808,10 @@ def change_shopee_password(
                     _enable_shopee_antibot_bypass(driver)
                     logger.info(f"Mở link xác nhận Shopee trên tab mới: {confirm_link}")
                     driver.get(confirm_link)
-                    time.sleep(6)
+                    time.sleep(5)
                     wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
+                    _wait_for_captcha(driver)
+                    time.sleep(3)
                 except Exception as e:
                     logger.warning(f"Lỗi khi mở tab xác nhận link Shopee: {e}")
                 finally:
@@ -822,23 +824,48 @@ def change_shopee_password(
 
                 logger.info("Đã xác nhận link Email! Chờ trang chính tự chuyển về Set Password...")
                 for _ in range(10):
-                    if "account/password" in (driver.current_url or ""):
+                    _wait_for_captcha(driver)
+                    cur_u = (driver.current_url or "").lower()
+                    if "user/account/password" in cur_u and "verify/" not in cur_u:
                         break
+                    driver.implicitly_wait(0)
+                    try:
+                        if any(
+                            el.is_displayed()
+                            for el in driver.find_elements(By.CSS_SELECTOR, "input[name='newPassword'], input[type='password']")
+                        ):
+                            break
+                    except Exception:
+                        pass
+                    finally:
+                        driver.implicitly_wait(5)
                     time.sleep(2)
-                if "account/password" not in (driver.current_url or ""):
+
+                cur_u = (driver.current_url or "").lower()
+                if "user/account/password" not in cur_u or "verify/" in cur_u:
                     driver.get(password_url)
                     time.sleep(4)
+                    wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
+                    _wait_for_captcha(driver)
             else:
                 logger.error(f"Không lấy được link xác nhận Shopee từ {tempmail_address}")
                 return False
 
+        _wait_for_captcha(driver)
         # Điền mật khẩu mới Shopee vào New Password & Confirm Password
-        inp1 = wait_for_element(
-            driver, By.CSS_SELECTOR, "input[name='newPassword']", timeout=10, condition="visible"
+        wait_for_element(
+            driver, By.CSS_SELECTOR, "input[name='newPassword'], input[type='password']", timeout=12, condition="visible"
         )
-        inp2 = wait_for_element(
-            driver, By.CSS_SELECTOR, "input[name='newPasswordRepeat']", timeout=5, condition="visible"
-        )
+        pwd_els = [el for el in driver.find_elements(By.CSS_SELECTOR, "input[type='password']") if el.is_displayed()]
+        if len(pwd_els) >= 2:
+            inp1, inp2 = pwd_els[0], pwd_els[1]
+        else:
+            inp1 = wait_for_element(
+                driver, By.CSS_SELECTOR, "input[name='newPassword'], input[type='password']", timeout=5, condition="visible"
+            )
+            inp2 = wait_for_element(
+                driver, By.CSS_SELECTOR, "input[name='newPasswordRepeat']", timeout=3, condition="visible"
+            )
         if not inp1 or not inp2:
             logger.error("Không tìm thấy ô nhập New Password trên Shopee")
             return False
