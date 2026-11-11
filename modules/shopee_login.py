@@ -176,6 +176,82 @@ def _open_new_tab(driver: WebDriver, url: str) -> bool:
         return False
 
 
+def _select_shopee_english_language(driver: WebDriver) -> bool:
+    """
+    Tự động chọn ngôn ngữ 'English' khi Shopee (MY / ID / PH) hiển thị hộp thoại
+    chọn ngôn ngữ ('Pilih bahasa Anda' / 'Pilih Bahasa Anda' / 'Select Your Language')
+    hoặc menu ngôn ngữ trên trang Affiliate đang ở Bahasa Indonesia / Bahasa Melayu.
+    """
+    driver.implicitly_wait(0)
+    try:
+        # 1. Hộp thoại popup chọn ngôn ngữ trên Shopee (Pilih bahasa Anda / Select Your Language)
+        lang_xpaths = [
+            "//*[contains(normalize-space(), 'Pilih bahasa') or contains(normalize-space(), 'Pilih Bahasa') or contains(normalize-space(), 'Select Your Language')]"
+            "/following::button[normalize-space()='English'][1]",
+            "//*[contains(normalize-space(), 'Pilih bahasa') or contains(normalize-space(), 'Pilih Bahasa') or contains(normalize-space(), 'Select Your Language')]"
+            "/following::*[normalize-space()='English' and not(*[normalize-space()='English'])][1]",
+            "//div[contains(@class, 'language-selection') or contains(@class, 'shopee-popup') or contains(@class, 'modal') or @role='dialog']"
+            "//*[self::button or @role='button' or contains(@class, 'item') or contains(@class, 'btn')][normalize-space()='English']",
+            "//button[normalize-space()='English']",
+        ]
+        for xp in lang_xpaths:
+            btns = [b for b in driver.find_elements(By.XPATH, xp) if b.is_displayed()]
+            if btns:
+                btn = btns[0]
+                logger.info("🌐 Phát hiện hộp thoại chọn ngôn ngữ trên Shopee -> Chọn 'English'...")
+                if not safe_click(btn, delay=2.0):
+                    driver.execute_script("arguments[0].click();", btn)
+                    time.sleep(2.0)
+                # Kiểm tra lại nếu nút English vẫn còn hiển thị thì click bằng JS
+                try:
+                    if btn.is_displayed():
+                        driver.execute_script("arguments[0].click();", btn)
+                        time.sleep(1.5)
+                except Exception:
+                    pass
+                logger.info("✅ Đã chọn ngôn ngữ 'English' trên Shopee!")
+                return True
+
+        # 2. Dropdown ngôn ngữ trên header trang Shopee Affiliate (nếu đang là Bahasa Indonesia / Melayu / Malaysia)
+        cur_url = (driver.current_url or "").lower()
+        if "affiliate.shopee." in cur_url:
+            aff_lang_triggers = [
+                e for e in driver.find_elements(
+                    By.XPATH,
+                    "//*[normalize-space()='Bahasa Indonesia' or normalize-space()='Indonesia' "
+                    "or normalize-space()='Bahasa Malaysia' or normalize-space()='Bahasa Melayu'][not(*)]",
+                )
+                if e.is_displayed()
+            ]
+            if aff_lang_triggers:
+                logger.info("🌐 Phát hiện ngôn ngữ Affiliate chưa phải English -> Chuyển sang 'English'...")
+                try:
+                    driver.execute_script("arguments[0].click();", aff_lang_triggers[0])
+                    time.sleep(1.0)
+                    en_opts = [
+                        e for e in driver.find_elements(
+                            By.XPATH,
+                            "//li[normalize-space()='English'] | //*[contains(@class, 'dropdown') or contains(@class, 'menu')]//*[normalize-space()='English']",
+                        )
+                        if e.is_displayed()
+                    ]
+                    if en_opts:
+                        driver.execute_script("arguments[0].click();", en_opts[0])
+                        time.sleep(2.0)
+                        logger.info("✅ Đã chuyển ngôn ngữ trang Affiliate sang 'English'!")
+                        return True
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.debug(f"Lỗi khi kiểm tra hộp thoại ngôn ngữ Shopee: {e}")
+    finally:
+        try:
+            driver.implicitly_wait(5)
+        except Exception:
+            pass
+    return False
+
+
 def _click_facebook_login_button(driver: WebDriver) -> bool:
     """
     Tìm và click nút đăng nhập bằng Facebook trên trang Shopee.
@@ -183,17 +259,22 @@ def _click_facebook_login_button(driver: WebDriver) -> bool:
     """
     logger.info("Đang tìm nút 'Facebook' trên Shopee Login...")
 
+    _select_shopee_english_language(driver)
+
     if _is_shopee_captcha_or_blocked(driver) or _check_shopee_logged_in_user(driver):
         return False
 
     # Chờ Facebook JS SDK (window.FB) khởi tạo xong trên trang buyer/login (tối đa 5s)
     for _ in range(10):
+        _select_shopee_english_language(driver)
         try:
             if driver.execute_script("return typeof window.FB !== 'undefined';"):
                 break
         except Exception:
             pass
         time.sleep(0.5)
+
+    _select_shopee_english_language(driver)
 
     selectors = [
         # Ưu tiên thẻ <button> chứa 'Facebook' trước tiên
@@ -797,7 +878,9 @@ def change_shopee_password(
         driver.get(password_url)
         time.sleep(5)
         wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
+        _select_shopee_english_language(driver)
         _wait_for_captcha(driver)
+        _select_shopee_english_language(driver)
 
         # Kiểm tra nút "Verify by Email Link" trên trang Security check (/verify/ivs)
         verify_link_selectors = [
@@ -958,6 +1041,7 @@ def _register_affiliate(
         time.sleep(4)
         wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
         time.sleep(2)
+        _select_shopee_english_language(driver)
         logger.info(f"Đã mở trang Affiliate: {driver.current_url}")
 
         def _click_enter_if_present() -> bool:
@@ -988,6 +1072,7 @@ def _register_affiliate(
 
         # Nếu hiện nút "Enter" ở trang giới thiệu Affiliate thì bấm "Enter"
         _click_enter_if_present()
+        _select_shopee_english_language(driver)
 
         if _is_shopee_phone_verification(driver):
             logger.warning("⚠️ Phát hiện màn hình 'Mobile Phone Verification' trên Shopee -> Bỏ qua luồng này!")
@@ -1518,9 +1603,10 @@ def login_shopee_account_via_facebook(
         existing_user = ""
         already_logged_in = False
         need_affiliate_fallback = False
-        for _ in range(12):  # Tối đa 6s (12 * 0.5s)
+        for poll_idx in range(12):  # Tối đa 6s (12 * 0.5s)
             time.sleep(0.5)
             check_browser_alive(driver)
+            _select_shopee_english_language(driver)
             if _is_shopee_phone_verification(driver):
                 logger.warning("⚠️ Phát hiện màn hình 'Mobile Phone Verification' trên Shopee -> Bỏ qua luồng này!")
                 raise LoginFailedError("Shopee yêu cầu xác minh SĐT (Mobile Phone Verification)")
@@ -1538,18 +1624,21 @@ def login_shopee_account_via_facebook(
                 )
                 need_affiliate_fallback = True
                 break
-            driver.implicitly_wait(0)
-            try:
-                fb_btns = driver.find_elements(By.XPATH, "//button[contains(., 'Facebook')]")
-                if fb_btns and any(b.is_displayed() for b in fb_btns):
-                    break
-            except Exception:
-                pass
-            finally:
+            # Chờ ít nhất 2s (poll_idx >= 4) để hộp thoại chọn ngôn ngữ (Pilih bahasa Anda / Select Your Language) kịp render
+            if poll_idx >= 4:
+                driver.implicitly_wait(0)
                 try:
-                    driver.implicitly_wait(5)
+                    fb_btns = driver.find_elements(By.XPATH, "//button[contains(., 'Facebook')]")
+                    if fb_btns and any(b.is_displayed() for b in fb_btns):
+                        _select_shopee_english_language(driver)
+                        break
                 except Exception:
                     pass
+                finally:
+                    try:
+                        driver.implicitly_wait(5)
+                    except Exception:
+                        pass
 
         if already_logged_in:
             return True
