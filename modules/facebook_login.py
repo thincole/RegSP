@@ -627,6 +627,8 @@ def _handle_checkpoint_956(
     hotmail_password: str = "",
     recovery_email: str = "",
     new_hotmail_pass: str = "",
+    recovery_domain: str = "",
+    forwarding_domain: str = "",
 ) -> bool:
     """
     Tự động mở khóa màn hình khóa tài khoản 'confirm this is your Meta Account to unlock it'
@@ -685,7 +687,9 @@ def _handle_checkpoint_956(
                 driver.execute_script("arguments[0].click();", email_opts[0])
                 time.sleep(4.0)
 
-        # Bước 3: Trước khi bấm 'Next' gửi mã về Hotmail, đảm bảo Hotmail đã được cài đặt Forwarding về @nguyenmaucole.io.vn
+        # Bước 3: Trước khi bấm 'Next' gửi mã về Hotmail, đảm bảo Hotmail đã được cài đặt Forwarding
+        rec_dom = ""
+        fwd_dom = ""
         if prefix and hotmail_password:
             from modules.hotmail_login import (
                 TEMPMAIL_API_URL,
@@ -696,27 +700,32 @@ def _handle_checkpoint_956(
             )
             from modules.change_password import change_hotmail_password
 
-            logger.info(f"Đảm bảo Hotmail ({hotmail_email}) đã đăng nhập & cài Forwarding trước khi nhận mã mở khóa FB...")
+            rec_dom = (recovery_domain or TEMPMAIL_DOMAIN).strip().lstrip("@").lower()
+            fwd_dom = (forwarding_domain or TEMPMAIL_DOMAIN).strip().lstrip("@").lower()
+            logger.info(f"Đảm bảo Hotmail ({hotmail_email}) đã đăng nhập & cài Forwarding về @{fwd_dom} trước khi nhận mã mở khóa FB...")
             driver.implicitly_wait(5)
             try:
                 if driver.window_handles and fb_handle != driver.window_handles[0]:
                     driver.switch_to.window(driver.window_handles[0])
                 hot_ok = login_hotmail(driver, hotmail_email, hotmail_password, recovery_email, new_fb_pass)
                 if hot_ok:
-                    replace_hotmail_recovery_email(driver, hotmail_email, recovery_email, hotmail_password, new_fb_pass)
+                    replace_hotmail_recovery_email(
+                        driver, hotmail_email, recovery_email, hotmail_password, new_fb_pass, target_domain=rec_dom
+                    )
                     change_hotmail_password(
                         driver,
                         hotmail_password,
                         new_fb_pass,
                         hotmail_email,
-                        f"{prefix}@{TEMPMAIL_DOMAIN}",
+                        f"{prefix}@{rec_dom}",
                     )
                     setup_hotmail_forwarding(
                         driver,
                         hotmail_email,
-                        f"{prefix}@{TEMPMAIL_DOMAIN}",
+                        f"{prefix}@{rec_dom}",
                         new_fb_pass,
                         hotmail_password,
+                        target_domain=fwd_dom,
                     )
             except Exception as e:
                 logger.warning(f"Cảnh báo khi chuẩn bị Hotmail cho 956 unlock: {e}")
@@ -725,14 +734,26 @@ def _handle_checkpoint_956(
                 driver.implicitly_wait(0)
                 time.sleep(1.5)
 
-        # Lấy min_id hiện tại trên tempmail để chỉ bắt thư mới gửi tới
+        # Lấy min_id / fvia_seen_ids hiện tại để chỉ bắt thư mới gửi tới
         min_id = 0
+        fvia_seen_ids = set()
         if prefix:
-            from modules.hotmail_login import TEMPMAIL_API_URL, TEMPMAIL_DOMAIN
+            from modules.hotmail_login import (
+                TEMPMAIL_API_URL,
+                TEMPMAIL_DOMAIN,
+                FVIA_DOMAIN,
+                _get_existing_fviainboxes_ids,
+            )
+            if not fwd_dom:
+                fwd_dom = (forwarding_domain or TEMPMAIL_DOMAIN).strip().lstrip("@").lower()
             try:
                 r0 = requests.get(TEMPMAIL_API_URL, params={"address": f"{prefix}@{TEMPMAIL_DOMAIN}"}, timeout=10)
                 if r0.status_code == 200 and isinstance(r0.json(), list) and r0.json():
                     min_id = int(r0.json()[0].get("id", 0))
+            except Exception:
+                pass
+            try:
+                fvia_seen_ids = _get_existing_fviainboxes_ids(prefix, domain=FVIA_DOMAIN)
             except Exception:
                 pass
 
@@ -754,15 +775,22 @@ def _handle_checkpoint_956(
                     driver.execute_script("arguments[0].click();", next_btns[0])
                     time.sleep(4.0)
 
-        # Bước 5: Chờ mã xác nhận Facebook từ @nguyenmaucole.io.vn và điền vào ô code
+        # Bước 5: Chờ mã xác nhận Facebook từ email chuyển tiếp (@nguyenmaucole.io.vn hoặc @fviainboxes.com) và điền vào ô code
         code_inps = [
             e for e in driver.find_elements(By.CSS_SELECTOR, "input[type='text'], input[type='tel'], input[type='number']")
             if e.is_displayed()
         ]
         if code_inps and prefix:
-            from modules.hotmail_login import TEMPMAIL_API_URL, TEMPMAIL_DOMAIN
+            from modules.hotmail_login import (
+                TEMPMAIL_API_URL,
+                TEMPMAIL_DOMAIN,
+                FVIA_DOMAIN,
+                FVIA_MESSAGES_API,
+                FVIA_MESSAGE_API,
+            )
+            full_target = f"{prefix}@{fwd_dom or TEMPMAIL_DOMAIN}"
             full_tempmail = f"{prefix}@{TEMPMAIL_DOMAIN}"
-            logger.info(f"Đang chờ mã mở khóa Facebook gửi về {full_tempmail} (tối đa 90s)...")
+            logger.info(f"Đang chờ mã mở khóa Facebook gửi về {full_target} (tối đa 90s)...")
             fb_code = None
             t0 = time.time()
             while time.time() - t0 < 90:
@@ -783,6 +811,39 @@ def _handle_checkpoint_956(
                                 if m_code:
                                     fb_code = m_code.group(1)
                                     break
+                    if fb_code:
+                        break
+                except Exception:
+                    pass
+
+                try:
+                    f_resp = requests.get(
+                        FVIA_MESSAGES_API,
+                        params={"username": prefix, "domain": FVIA_DOMAIN},
+                        headers={"User-Agent": "Mozilla/5.0"},
+                        timeout=10,
+                    )
+                    if f_resp.status_code == 200:
+                        for msg in (f_resp.json().get("result") or []):
+                            mid_str = str(msg.get("id", ""))
+                            if not mid_str or mid_str in fvia_seen_ids:
+                                continue
+                            subj = str(msg.get("subject", "") or "")
+                            frm = str(msg.get("from", "") or msg.get("sender", "") or "")
+                            b_resp = requests.get(
+                                FVIA_MESSAGE_API,
+                                params={"username": prefix, "domain": FVIA_DOMAIN, "id": mid_str},
+                                headers={"User-Agent": "Mozilla/5.0"},
+                                timeout=10,
+                            )
+                            body = b_resp.text if b_resp.status_code == 200 else ""
+                            if "facebook" in (frm + subj + body).lower() or "security" in (subj + body).lower():
+                                clean_b = re.sub(r"<[^>]+>", " ", body)
+                                m_code = re.search(r"\b(\d{6,8})\b", subj) or re.search(r"\b(\d{6,8})\b", clean_b)
+                                if m_code:
+                                    fb_code = m_code.group(1)
+                                    break
+                            fvia_seen_ids.add(mid_str)
                     if fb_code:
                         break
                 except Exception:
@@ -879,6 +940,8 @@ def _import_facebook_cookie(
     hotmail_password: str = "",
     recovery_email: str = "",
     new_hotmail_pass: str = "",
+    recovery_domain: str = "",
+    forwarding_domain: str = "",
 ) -> str:
     """
     Đăng nhập Facebook bằng cách nạp trực tiếp chuỗi Cookie (cơ chế giống hệt extension 'Get Token Cookie'):
@@ -987,7 +1050,9 @@ def _import_facebook_cookie(
     # 4. Xử lý cảnh báo hành vi tự động ('Bỏ qua' / 'Dismiss'), mở khóa 956 ('Get started'), hoặc popup sau đăng nhập nếu có
     _dismiss_automated_behavior_warning(driver)
     if "828281030927956" in (driver.current_url or "").lower():
-        _handle_checkpoint_956(driver, hotmail_email, hotmail_password, recovery_email, new_hotmail_pass)
+        _handle_checkpoint_956(
+            driver, hotmail_email, hotmail_password, recovery_email, new_hotmail_pass, recovery_domain, forwarding_domain
+        )
     _handle_post_2fa_prompts(driver)
 
     cur_url = (driver.current_url or "").lower()
@@ -1008,6 +1073,7 @@ def login_facebook(
     fb_2fa_secret: str = "", fb_cookie: str = "",
     hotmail_email: str = "", hotmail_password: str = "",
     recovery_email: str = "", new_hotmail_pass: str = "",
+    recovery_domain: str = "", forwarding_domain: str = "",
 ) -> bool:
     """
     Đăng nhập Facebook:
@@ -1027,7 +1093,9 @@ def login_facebook(
         time.sleep(2.5)
 
         if "828281030927956" in (driver.current_url or "").lower():
-            _handle_checkpoint_956(driver, hotmail_email, hotmail_password, recovery_email, new_hotmail_pass)
+            _handle_checkpoint_956(
+                driver, hotmail_email, hotmail_password, recovery_email, new_hotmail_pass, recovery_domain, forwarding_domain
+            )
 
         if _check_already_logged_in(driver):
             logger.info("✅ Facebook đã đăng nhập sẵn trên profile này!")
@@ -1036,7 +1104,8 @@ def login_facebook(
         # Ưu tiên đăng nhập nhanh bằng Cookie (cơ chế từ extension Get Token Cookie)
         if fb_cookie and "c_user=" in fb_cookie:
             cookie_status = _import_facebook_cookie(
-                driver, fb_cookie, hotmail_email, hotmail_password, recovery_email, new_hotmail_pass
+                driver, fb_cookie, hotmail_email, hotmail_password, recovery_email, new_hotmail_pass,
+                recovery_domain, forwarding_domain,
             )
             if cookie_status == "SUCCESS":
                 return True
@@ -1107,7 +1176,9 @@ def login_facebook(
         # Kiểm tra nhanh cảnh báo hành vi tự động hoặc checkpoint 956
         _dismiss_automated_behavior_warning(driver)
         if "828281030927956" in (driver.current_url or "").lower():
-            _handle_checkpoint_956(driver, hotmail_email, hotmail_password, recovery_email, new_hotmail_pass)
+            _handle_checkpoint_956(
+                driver, hotmail_email, hotmail_password, recovery_email, new_hotmail_pass, recovery_domain, forwarding_domain
+            )
 
         current_url = driver.current_url.lower()
 

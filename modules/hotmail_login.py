@@ -2145,22 +2145,24 @@ def setup_hotmail_forwarding(
     recovery_email: str = "",
     new_hotmail_pass: str = "",
     old_hotmail_pass: str = "",
+    target_domain: str = TEMPMAIL_DOMAIN,
 ) -> str:
     """
     Trước khi vào cài đặt Forwarding:
     - Kiểm tra trang Hotmail đã login chưa; nếu chưa thì đăng nhập bằng mật khẩu mới ('Khoa01@c' / new_hotmail_pass).
     Sau đó truy cập https://outlook.live.com/mail/options/mail/forwarding,
     đóng popup lần đầu (nếu có), xử lý nút 'Sign in' (nếu có),
-    bật 'Enable forwarding', điền <prefix>@nguyenmaucole.io.vn và bấm 'Save'.
+    bật 'Enable forwarding', điền <prefix>@<target_domain> (nguyenmaucole.io.vn hoặc fviainboxes.com) và bấm 'Save'.
     Trả về địa chỉ email forwarding nếu thành công, ngược lại trả về chuỗi rỗng "".
     """
-    prefix = hotmail_email.split("@")[0].strip()
-    forward_email = f"{prefix}@{TEMPMAIL_DOMAIN}"
+    prefix = hotmail_email.split("@")[0].strip().lower()
+    target_dom = (target_domain or TEMPMAIL_DOMAIN).strip().lstrip("@").lower()
+    forward_email = f"{prefix}@{target_dom}"
     forwarding_url = "https://outlook.live.com/mail/options/mail/forwarding"
     if not new_hotmail_pass:
         new_hotmail_pass = getattr(config, "NEW_HOTMAIL_PASSWORD", "Khoa01@c")
 
-    logger.info(f"=== BƯỚC 3: Cài đặt Forwarding ({forwarding_url} -> {forward_email}) ===")
+    logger.info(f"=== BƯỚC 4: Cài đặt Forwarding ({forwarding_url} -> {forward_email}) ===")
     try:
         # Kiểm tra đã login Hotmail chưa; nếu chưa thì login bằng mật khẩu mới trước khi vào trang Forwarding
         _ensure_hotmail_logged_in_before_forwarding(
@@ -2277,14 +2279,23 @@ def setup_hotmail_forwarding(
             logger.error("Không tìm thấy ô nhập email Forwarding")
             return ""
 
-        # Xóa nội dung cũ (nếu có) và nhập email @nguyenmaucole.io.vn
-        if not safe_click(fwd_input, delay=0.3):
-            _dismiss_outlook_popups(driver)
-            safe_click(fwd_input, delay=0.3)
-        fwd_input.send_keys(Keys.CONTROL + "a")
-        fwd_input.send_keys(Keys.BACKSPACE)
-        safe_send_keys(fwd_input, forward_email, delay=1.0, clear_first=False)
-        logger.info(f"Đã điền email chuyển tiếp: {forward_email}")
+        # Kiểm tra giá trị hiện tại trong ô Forwarding; nếu chưa đúng thì xóa sạch và điền forward_email mới
+        current_fwd_val = (fwd_input.get_attribute("value") or "").strip().lower()
+        if current_fwd_val != forward_email.lower():
+            if not safe_click(fwd_input, delay=0.3):
+                _dismiss_outlook_popups(driver)
+                safe_click(fwd_input, delay=0.3)
+            fwd_input.send_keys(Keys.CONTROL + "a")
+            fwd_input.send_keys(Keys.BACKSPACE)
+            if (fwd_input.get_attribute("value") or "").strip():
+                try:
+                    fwd_input.clear()
+                except Exception:
+                    pass
+            safe_send_keys(fwd_input, forward_email, delay=1.0, clear_first=False)
+            logger.info(f"Đã điền email chuyển tiếp: {forward_email}")
+        else:
+            logger.info(f"Ô Forwarding đã có sẵn địa chỉ đúng: {forward_email}")
 
         _dismiss_outlook_popups(driver)
 
@@ -2332,6 +2343,12 @@ def setup_hotmail_forwarding(
         else:
             logger.info("Cài đặt Forwarding đã được lưu trước đó (không cần bấm Save)")
 
+        if _is_fvia_domain(target_dom):
+            try:
+                _get_existing_fviainboxes_ids(prefix, domain=target_dom)
+            except Exception:
+                pass
+
         return forward_email
     except BrowserClosedError:
         raise
@@ -2348,24 +2365,27 @@ def replace_hotmail_recovery_email(
     recovery_email: str = "",
     current_password: str = "",
     new_hotmail_pass: str = "",
+    target_domain: str = TEMPMAIL_DOMAIN,
 ) -> bool:
     """
-    Thay đổi email khôi phục của Hotmail sang <prefix>@nguyenmaucole.io.vn tại
+    Thay đổi email khôi phục của Hotmail sang <prefix>@<target_domain>
+    (hỗ trợ cả @nguyenmaucole.io.vn và @fviainboxes.com) tại
     https://account.live.com/proofs/Manage/additional:
-      1. Nếu email khôi phục hiện tại đã có đuôi @nguyenmaucole.io.vn (và không còn mail cũ khác) -> bỏ qua ngay.
-      2. Thêm email khôi phục mới <prefix>@nguyenmaucole.io.vn trước (nhận mã 6 số qua API tempmail).
-      3. Xóa các email khôi phục cũ (như @boxnt.com, @fviainboxes.com, @dropinboxes.com...) sau.
+      1. Nếu email khôi phục hiện tại đã đúng là <prefix>@<target_domain> (và không còn mail cũ khác) -> bỏ qua ngay.
+      2. Thêm email khôi phục mới <prefix>@<target_domain> trước (nhận mã 6 số qua API tương ứng).
+      3. Xóa các email khôi phục cũ khác sau.
     """
     if not hotmail_email or "@" not in hotmail_email:
         logger.error("Thiếu địa chỉ Hotmail để thay email khôi phục")
         return False
 
     prefix = hotmail_email.split("@")[0].strip().lower()
-    new_rec_email = f"{prefix}@{TEMPMAIL_DOMAIN}"
+    target_dom = (target_domain or TEMPMAIL_DOMAIN).strip().lstrip("@").lower()
+    new_rec_email = f"{prefix}@{target_dom}"
 
-    if recovery_email and TEMPMAIL_DOMAIN in recovery_email.lower():
+    if recovery_email and recovery_email.strip().lower() == new_rec_email:
         logger.info(
-            f"ℹ️ Email khôi phục trong dữ liệu đã là đuôi @{TEMPMAIL_DOMAIN} ({recovery_email}) -> Bỏ qua bước thay mail khôi phục!"
+            f"ℹ️ Email khôi phục trong dữ liệu đã đúng là {new_rec_email} -> Bỏ qua bước thay mail khôi phục!"
         )
         return True
 
@@ -2395,17 +2415,30 @@ def replace_hotmail_recovery_email(
                 if any(el.is_displayed() for el in manage_els):
                     break
 
-            # Nếu màn hình xác minh hiện 'Send a code to ...@nguyenmaucole.io.vn' mà không có recovery_email cũ
+            # Nếu màn hình xác minh hiện 'Send a code to ...@<target_dom>' mà không có recovery_email cũ
             try:
                 body_txt_check = (driver.find_element(By.TAG_NAME, "body").text or "").lower()
+                other_known_domains = [
+                    d
+                    for d in (
+                        TEMPMAIL_DOMAIN,
+                        FVIA_DOMAIN,
+                        "fviadropinbox.com",
+                        "fviamail.work",
+                        "dropinboxes.com",
+                        BOXNT_DOMAIN,
+                        "tempinbox.vn",
+                        "tmpmails.net",
+                    )
+                    if d != target_dom
+                ]
                 if (
-                    TEMPMAIL_DOMAIN in body_txt_check
+                    f"@{target_dom}" in body_txt_check
                     and not recovery_email
-                    and not _is_fvia_domain(body_txt_check)
-                    and not _is_boxnt_domain(body_txt_check)
+                    and not any(d in body_txt_check for d in other_known_domains)
                 ):
                     logger.info(
-                        f"ℹ️ Phát hiện tài khoản đã dùng sẵn email khôi phục @{TEMPMAIL_DOMAIN} -> Bỏ qua bước thay mail khôi phục!"
+                        f"ℹ️ Phát hiện tài khoản đã dùng sẵn email khôi phục @{target_dom} -> Bỏ qua bước thay mail khôi phục!"
                     )
                     return True
             except Exception:
@@ -2443,28 +2476,41 @@ def replace_hotmail_recovery_email(
         )
         time.sleep(1.5)
 
+        rec_low = (recovery_email or "").strip().lower()
+
+        def _is_matching_target_proof(proof_text: str) -> bool:
+            t_low = (proof_text or "").lower()
+            if new_rec_email in t_low:
+                return True
+            if f"@{target_dom}" in t_low:
+                # Nếu proof chứa đúng địa chỉ recovery_email cũ khác prefix (vd: random999@fviainboxes.com) thì coi là mail cũ cần thay
+                if rec_low and rec_low != new_rec_email and rec_low in t_low:
+                    return False
+                return True
+            return False
+
         email_proofs = driver.find_elements(By.CSS_SELECTOR, "div[data-mp-proof-type='email']")
         active_email_proofs = [
             el for el in email_proofs
             if (el.get_attribute("data-pending-deletion") or "0") != "1"
         ]
-        has_tempmail = any(
-            TEMPMAIL_DOMAIN in (el.get_attribute("textContent") or "").lower()
+        has_target_rec = any(
+            _is_matching_target_proof(el.get_attribute("textContent") or "")
             for el in active_email_proofs
         )
         old_proofs = [
             el for el in active_email_proofs
-            if TEMPMAIL_DOMAIN not in (el.get_attribute("textContent") or "").lower()
+            if not _is_matching_target_proof(el.get_attribute("textContent") or "")
         ]
 
-        if has_tempmail and not old_proofs:
+        if has_target_rec and not old_proofs:
             logger.info(
-                f"ℹ️ Email khôi phục hiện tại trên Microsoft đã là đuôi @{TEMPMAIL_DOMAIN} -> Bỏ qua sang bước tiếp theo!"
+                f"ℹ️ Email khôi phục hiện tại trên Microsoft đã là @{target_dom} -> Bỏ qua sang bước tiếp theo!"
             )
             return True
 
-        # Bước A: Thêm email khôi phục mới <prefix>@nguyenmaucole.io.vn (nếu chưa có)
-        if not has_tempmail:
+        # Bước A: Thêm email khôi phục mới <prefix>@<target_dom> (nếu chưa có)
+        if not has_target_rec:
             logger.info(f"Đang thêm email khôi phục mới: {new_rec_email}...")
             add_link = wait_for_element(
                 driver,
@@ -2542,7 +2588,12 @@ def replace_hotmail_recovery_email(
                 logger.error("Không tìm thấy ô nhập email khôi phục mới (#EmailAddress / #email)")
                 return False
 
-            min_mail_id = _get_latest_tempmail_id(prefix)
+            min_mail_id = 0
+            fvia_seen_ids = set()
+            if _is_fvia_domain(target_dom):
+                fvia_seen_ids = _get_existing_fviainboxes_ids(prefix, domain=target_dom)
+            else:
+                min_mail_id = _get_latest_tempmail_id(prefix)
             safe_click(email_inp, delay=0.3)
             email_inp.clear()
             safe_send_keys(email_inp, new_rec_email, delay=0.8)
@@ -2586,7 +2637,12 @@ def replace_hotmail_recovery_email(
                 logger.error("Không tìm thấy ô nhập mã OTP (#iOttText / #ottCode) khi thêm email khôi phục mới")
                 return False
 
-            code = _fetch_code_from_tempmail(driver, prefix, min_id=min_mail_id, timeout=90)
+            if _is_fvia_domain(target_dom):
+                code = _fetch_code_from_fviainboxes(
+                    driver, prefix, domain=target_dom, seen_ids=fvia_seen_ids, timeout=90
+                )
+            else:
+                code = _fetch_code_from_tempmail(driver, prefix, min_id=min_mail_id, timeout=90)
             if not code:
                 logger.error(f"Không lấy được mã xác nhận từ {new_rec_email}")
                 return False
@@ -2633,7 +2689,7 @@ def replace_hotmail_recovery_email(
                 condition="presence",
             )
 
-        # Bước B: Xóa các email khôi phục cũ (không phải @nguyenmaucole.io.vn)
+        # Bước B: Xóa các email khôi phục cũ (không khớp <prefix>@<target_dom>)
         for _ in range(5):
             email_proofs = driver.find_elements(By.CSS_SELECTOR, "div[data-mp-proof-type='email']")
             target_old_el = None
@@ -2642,7 +2698,7 @@ def replace_hotmail_recovery_email(
                 if (el.get_attribute("data-pending-deletion") or "0") == "1":
                     continue
                 txt = (el.get_attribute("textContent") or "").strip()
-                if TEMPMAIL_DOMAIN not in txt.lower():
+                if not _is_matching_target_proof(txt):
                     target_old_el = el
                     try:
                         spans = el.find_elements(By.CSS_SELECTOR, ".pullout-textwrap span, .pullout-textwrap")

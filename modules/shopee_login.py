@@ -7,10 +7,13 @@ import time
 import random
 import re
 import json
+import html
 import urllib.request
 import urllib.parse
 from typing import Tuple
 
+import requests
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.action_chains import ActionChains
@@ -618,18 +621,234 @@ def _handle_facebook_popup(
 
 
 def _get_existing_tempmail_ids(tempmail_address: str) -> set:
-    """Lấy danh sách ID các email hiện có trong hộp thư nguyenmaucole.io.vn để tránh đọc lại code cũ."""
-    addr = tempmail_address.strip().lower()
-    api_url = f"https://tempmail-backend.thincole.workers.dev/api/emails?address={addr}"
+    """Lấy danh sách ID các email hiện có trên cả nguyenmaucole.io.vn và fviainboxes.com để tránh đọc lại code/link cũ."""
+    addr = (tempmail_address or "").strip().lower()
+    if not addr or "@" not in addr:
+        return set()
+    prefix, dom = addr.split("@", 1)
+    seen = set()
+
+    # 1. Snapshot nguyenmaucole.io.vn
+    nmc_addr = f"{prefix}@nguyenmaucole.io.vn"
+    nmc_url = f"https://tempmail-backend.thincole.workers.dev/api/emails?address={nmc_addr}"
+    try:
+        req = urllib.request.Request(nmc_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        if isinstance(data, list):
+            for m in data:
+                if isinstance(m, dict) and m.get("id") is not None:
+                    seen.add(f"nmc:{m.get('id')}")
+                    seen.add(m.get("id"))
+    except Exception:
+        pass
+
+    # 2. Snapshot fviainboxes.com
+    fvia_dom = dom if "fvia" in dom or "dropinboxes" in dom else "fviainboxes.com"
+    try:
+        resp = requests.get(
+            "https://fviainboxes.com/messages",
+            params={"username": prefix, "domain": fvia_dom},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=8,
+        )
+        if resp.status_code == 200:
+            for msg in (resp.json().get("result") or []):
+                if isinstance(msg, dict) and msg.get("id") is not None:
+                    seen.add(f"fvia:{msg.get('id')}")
+    except Exception:
+        pass
+
+    return seen
+
+
+def _check_nmc_for_shopee_otp(prefix: str, seen_ids: set) -> str:
+    """Kiểm tra hộp thư nguyenmaucole.io.vn tìm mã OTP 6 chữ số của Shopee."""
+    nmc_addr = f"{prefix}@nguyenmaucole.io.vn"
+    api_url = f"https://tempmail-backend.thincole.workers.dev/api/emails?address={nmc_addr}"
     try:
         req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="ignore"))
         if isinstance(data, list):
-            return {m.get("id") for m in data if isinstance(m, dict) and m.get("id") is not None}
-    except Exception:
-        pass
-    return set()
+            for m in data:
+                if not isinstance(m, dict):
+                    continue
+                msg_id = m.get("id")
+                if msg_id in seen_ids or f"nmc:{msg_id}" in seen_ids:
+                    continue
+                subj = (m.get("subject") or "").lower()
+                sender = (m.get("sender") or "").lower()
+                if "shopee" in subj or "shopee" in sender or "verification" in subj or "kode" in subj:
+                    body_html = m.get("body_html") or ""
+                    text = re.sub(r"<[^>]+>", " ", body_html)
+                    text = re.sub(r"\s+", " ", text)
+                    codes = re.findall(r"\b(\d{6})\b", text)
+                    if codes:
+                        logger.info(f"✅ Đã lấy được mã OTP Shopee từ {nmc_addr}: {codes[0]}")
+                        return codes[0]
+                seen_ids.add(f"nmc:{msg_id}")
+    except Exception as e:
+        logger.debug(f"Lỗi gọi API nguyenmaucole.io.vn: {e}")
+    return ""
+
+
+def _check_fvia_for_shopee_otp(prefix: str, fvia_dom: str, seen_ids: set) -> Tuple[str, bool]:
+    """
+    Kiểm tra hộp thư fviainboxes.com tìm mã OTP 6 chữ số của Shopee.
+    Trả về (otp_code, need_browser_turnstile).
+    """
+    full_addr = f"{prefix}@{fvia_dom}"
+    try:
+        resp = requests.get(
+            "https://fviainboxes.com/messages",
+            params={"username": prefix, "domain": fvia_dom},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        if resp.status_code == 403:
+            return "", True
+        if resp.status_code == 200:
+            messages = resp.json().get("result") or []
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                msg_id = str(msg.get("id", ""))
+                if not msg_id or f"fvia:{msg_id}" in seen_ids or msg_id in seen_ids:
+                    continue
+                subj = str(msg.get("subject") or "").lower()
+                sender = str(msg.get("from") or msg.get("sender") or "").lower()
+                if "shopee" in subj or "shopee" in sender or "verification" in subj or "kode" in subj or "code" in subj:
+                    body_resp = requests.get(
+                        "https://fviainboxes.com/message",
+                        params={"username": prefix, "domain": fvia_dom, "id": msg_id},
+                        headers={"User-Agent": "Mozilla/5.0"},
+                        timeout=10,
+                    )
+                    body_html = ""
+                    if body_resp.status_code == 200:
+                        try:
+                            raw_json = body_resp.json()
+                            if isinstance(raw_json, str):
+                                body_html = raw_json
+                            elif isinstance(raw_json, dict):
+                                body_html = str(raw_json.get("result", "") or "")
+                            else:
+                                body_html = body_resp.text
+                        except Exception:
+                            body_html = body_resp.text
+                    text = re.sub(r"<[^>]+>", " ", body_html)
+                    text = re.sub(r"\s+", " ", text)
+                    codes = re.findall(r"\b(\d{6})\b", text + " " + subj)
+                    if codes:
+                        logger.info(f"✅ Đã lấy được mã OTP Shopee từ {full_addr}: {codes[0]}")
+                        return codes[0], False
+                seen_ids.add(f"fvia:{msg_id}")
+    except Exception as e:
+        logger.debug(f"Lỗi gọi API fviainboxes.com: {e}")
+    return "", False
+
+
+def _fetch_fvia_browser_content(driver: WebDriver, prefix: str, fvia_dom: str, mode: str = "otp") -> str:
+    """Fallback mở tab https://fviainboxes.com/ trên trình duyệt để lấy mã OTP hoặc link Shopee khi API bật Turnstile."""
+    logger.info(f"Mở tab https://fviainboxes.com/ trên trình duyệt để lấy {mode.upper()} Shopee cho {prefix}@{fvia_dom}...")
+    main_handle = driver.current_window_handle
+    try:
+        driver.switch_to.new_window("tab")
+        driver.get("https://fviainboxes.com/")
+        wait_for_page_load(driver, timeout=15)
+        time.sleep(2)
+
+        user_inp = wait_for_element(
+            driver,
+            By.CSS_SELECTOR,
+            "input#username, input[name='username'], input[placeholder*='username']",
+            timeout=10,
+            condition="visible",
+        )
+        if user_inp:
+            safe_send_keys(user_inp, prefix, delay=0.5)
+            try:
+                domain_btn = wait_for_element(
+                    driver,
+                    By.CSS_SELECTOR,
+                    "button[id^='headlessui-listbox-button'], button[aria-haspopup='listbox']",
+                    timeout=3,
+                    condition="clickable",
+                )
+                if domain_btn and fvia_dom not in (domain_btn.text or "").lower():
+                    if not safe_click(domain_btn, delay=0.8):
+                        driver.execute_script("arguments[0].click();", domain_btn)
+                        time.sleep(0.8)
+                    opt = wait_for_element(
+                        driver,
+                        By.XPATH,
+                        f"//li[contains(normalize-space(), '{fvia_dom}')] | //*[@role='option'][contains(normalize-space(), '{fvia_dom}')]",
+                        timeout=3,
+                        condition="clickable",
+                    )
+                    if opt:
+                        if not safe_click(opt, delay=0.8):
+                            driver.execute_script("arguments[0].click();", opt)
+                            time.sleep(0.8)
+            except Exception:
+                pass
+
+            get_btn = wait_for_element(driver, By.XPATH, "//button[contains(., 'Get Email')]", timeout=5, condition="clickable")
+            if get_btn:
+                safe_click(get_btn, delay=3.0)
+
+            for _ in range(10):
+                mail_items = [
+                    el for el in driver.find_elements(By.CSS_SELECTOR, "ul li.group, main ul li")
+                    if el.is_displayed() and ("shopee" in (el.text or "").lower() or "verification" in (el.text or "").lower())
+                ]
+                target_item = mail_items[0] if mail_items else wait_for_element(
+                    driver, By.CSS_SELECTOR, "ul li.group, main ul li", timeout=3, condition="clickable"
+                )
+                if target_item:
+                    safe_click(target_item, delay=2.0)
+                    iframe_el = wait_for_element(
+                        driver, By.CSS_SELECTOR, "iframe[title='Email content'], article iframe, iframe",
+                        timeout=5, condition="presence",
+                    )
+                    if iframe_el:
+                        srcdoc = iframe_el.get_attribute("srcdoc") or ""
+                        if not srcdoc:
+                            try:
+                                driver.switch_to.frame(iframe_el)
+                                srcdoc = driver.page_source or driver.find_element(By.TAG_NAME, "body").text
+                                driver.switch_to.default_content()
+                            except Exception:
+                                driver.switch_to.default_content()
+                        if mode == "link":
+                            links = re.findall(r'href=["\'](https?://[^"\']+)["\']', srcdoc)
+                            for raw_link in links:
+                                link = html.unescape(raw_link)
+                                if "shp.ee/dlink" in link or "verify/email-link" in link or "dlink" in link:
+                                    logger.info(f"✅ Đã lấy được link xác nhận Shopee từ UI fviainboxes.com: {link}")
+                                    return link
+                        else:
+                            text_clean = re.sub(r"<[^>]+>", " ", srcdoc)
+                            codes = re.findall(r"\b(\d{6})\b", text_clean)
+                            if codes:
+                                logger.info(f"✅ Đã lấy được mã OTP Shopee từ UI fviainboxes.com: {codes[0]}")
+                                return codes[0]
+                refresh_btn = wait_for_element(driver, By.XPATH, "//button[contains(., 'Get Email')]", timeout=2, condition="clickable")
+                if refresh_btn:
+                    safe_click(refresh_btn, delay=3.0)
+                else:
+                    time.sleep(3)
+    except Exception as e:
+        logger.warning(f"Fallback UI fviainboxes.com lỗi: {e}")
+    finally:
+        try:
+            if driver.current_window_handle != main_handle and len(driver.window_handles) > 1:
+                driver.close()
+            driver.switch_to.window(main_handle)
+        except Exception:
+            pass
+    return ""
 
 
 def _fetch_shopee_email_otp(
@@ -639,54 +858,60 @@ def _fetch_shopee_email_otp(
     timeout: int = 180,
 ) -> str:
     """
-    Lấy mã OTP 6 chữ số của Shopee từ mail.nguyenmaucole.io.vn (qua API + fallback trình duyệt).
+    Lấy mã OTP 6 chữ số của Shopee từ hộp thư chuyển tiếp (@nguyenmaucole.io.vn hoặc @fviainboxes.com).
+    Tự động kiểm tra cả domain chính lẫn domain phụ để tránh trượt mã nếu mail được forward sang bên còn lại.
     """
     addr = tempmail_address.strip().lower()
-    api_url = f"https://tempmail-backend.thincole.workers.dev/api/emails?address={addr}"
+    prefix, dom = addr.split("@", 1) if "@" in addr else (addr, "nguyenmaucole.io.vn")
+    is_fvia_primary = "fvia" in dom or "dropinboxes" in dom
+    fvia_dom = dom if is_fvia_primary else "fviainboxes.com"
     if seen_ids is None:
         seen_ids = set()
 
     logger.info(f"Đang lấy mã OTP Shopee từ {addr} (tối đa {timeout}s)...")
     start_time = time.time()
+    fvia_blocked = False
 
     while time.time() - start_time < timeout:
         check_browser_alive(driver)
-        try:
-            req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode("utf-8", errors="ignore"))
-
-            if isinstance(data, list):
-                for m in data:
-                    if not isinstance(m, dict):
-                        continue
-                    msg_id = m.get("id")
-                    if msg_id in seen_ids:
-                        continue
-                    subj = (m.get("subject") or "").lower()
-                    sender = (m.get("sender") or "").lower()
-                    if "shopee" in subj or "shopee" in sender or "verification" in subj:
-                        body_html = m.get("body_html") or ""
-                        text = re.sub(r"<[^>]+>", " ", body_html)
-                        text = re.sub(r"\s+", " ", text)
-                        codes = re.findall(r"\b(\d{6})\b", text)
-                        if codes:
-                            code = codes[0]
-                            logger.info(f"✅ Đã lấy được mã OTP Shopee từ {addr}: {code}")
-                            return code
-        except Exception as e:
-            logger.debug(f"Lỗi gọi API tempmail: {e}")
+        if is_fvia_primary:
+            if not fvia_blocked:
+                code, blocked = _check_fvia_for_shopee_otp(prefix, fvia_dom, seen_ids)
+                if code:
+                    return code
+                if blocked:
+                    fvia_blocked = True
+                    # Chờ 8s cho thư kịp chuyển tiếp tới rồi mở UI fviainboxes.com lấy trực tiếp
+                    if time.time() - start_time >= 8:
+                        ui_code = _fetch_fvia_browser_content(driver, prefix, fvia_dom, mode="otp")
+                        if ui_code:
+                            return ui_code
+            code_alt = _check_nmc_for_shopee_otp(prefix, seen_ids)
+            if code_alt:
+                return code_alt
+        else:
+            code = _check_nmc_for_shopee_otp(prefix, seen_ids)
+            if code:
+                return code
+            if not fvia_blocked:
+                code_alt, blocked = _check_fvia_for_shopee_otp(prefix, fvia_dom, seen_ids)
+                if code_alt:
+                    return code_alt
+                if blocked:
+                    fvia_blocked = True
 
         elapsed = int(time.time() - start_time)
         if elapsed > 0 and elapsed % 9 == 0:
             logger.info(f"Đang chờ email OTP Shopee gửi về {addr}... ({elapsed}s/{timeout}s)")
         time.sleep(3)
 
+    if is_fvia_primary:
+        return _fetch_fvia_browser_content(driver, prefix, fvia_dom, mode="otp")
+
     # Fallback: mở tab https://mail.nguyenmaucole.io.vn trên trình duyệt
     logger.info("Thử mở tab https://mail.nguyenmaucole.io.vn trên trình duyệt để lấy code...")
     main_handle = driver.current_window_handle
     try:
-        prefix = addr.split("@")[0]
         driver.switch_to.new_window("tab")
         driver.get("https://mail.nguyenmaucole.io.vn")
         time.sleep(4)
@@ -775,6 +1000,90 @@ def _get_affiliate_account_setting(driver: WebDriver, affiliate_url: str) -> Tup
         driver.implicitly_wait(5)
 
 
+def _check_nmc_for_shopee_link(prefix: str, seen_ids: set) -> str:
+    """Kiểm tra hộp thư nguyenmaucole.io.vn tìm link xác nhận Shopee."""
+    nmc_addr = f"{prefix}@nguyenmaucole.io.vn"
+    api_url = f"https://tempmail-backend.thincole.workers.dev/api/emails?address={nmc_addr}"
+    try:
+        req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        if isinstance(data, list):
+            for m in data:
+                if not isinstance(m, dict):
+                    continue
+                msg_id = m.get("id")
+                if msg_id in seen_ids or f"nmc:{msg_id}" in seen_ids:
+                    continue
+                subj = (m.get("subject") or "").lower()
+                sender = (m.get("sender") or "").lower()
+                if "shopee" in subj or "shopee" in sender or "verification" in subj or "password" in subj or "verifikasi" in subj:
+                    body_html = m.get("body_html") or ""
+                    links = re.findall(r'href=["\'](https?://[^"\']+)["\']', body_html)
+                    for raw_link in links:
+                        link = html.unescape(raw_link)
+                        if "shp.ee/dlink" in link or "verify/email-link" in link or "dlink" in link:
+                            logger.info(f"✅ Đã lấy được link xác nhận Shopee từ {nmc_addr}: {link}")
+                            return link
+                seen_ids.add(f"nmc:{msg_id}")
+    except Exception as e:
+        logger.debug(f"Lỗi gọi API nguyenmaucole.io.vn tìm link: {e}")
+    return ""
+
+
+def _check_fvia_for_shopee_link(prefix: str, fvia_dom: str, seen_ids: set) -> Tuple[str, bool]:
+    """Kiểm tra hộp thư fviainboxes.com tìm link xác nhận Shopee."""
+    full_addr = f"{prefix}@{fvia_dom}"
+    try:
+        resp = requests.get(
+            "https://fviainboxes.com/messages",
+            params={"username": prefix, "domain": fvia_dom},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        if resp.status_code == 403:
+            return "", True
+        if resp.status_code == 200:
+            messages = resp.json().get("result") or []
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                msg_id = str(msg.get("id", ""))
+                if not msg_id or f"fvia:{msg_id}" in seen_ids or msg_id in seen_ids:
+                    continue
+                subj = str(msg.get("subject") or "").lower()
+                sender = str(msg.get("from") or msg.get("sender") or "").lower()
+                if "shopee" in subj or "shopee" in sender or "verification" in subj or "password" in subj or "verifikasi" in subj:
+                    body_resp = requests.get(
+                        "https://fviainboxes.com/message",
+                        params={"username": prefix, "domain": fvia_dom, "id": msg_id},
+                        headers={"User-Agent": "Mozilla/5.0"},
+                        timeout=10,
+                    )
+                    body_html = ""
+                    if body_resp.status_code == 200:
+                        try:
+                            raw_json = body_resp.json()
+                            if isinstance(raw_json, str):
+                                body_html = raw_json
+                            elif isinstance(raw_json, dict):
+                                body_html = str(raw_json.get("result", "") or "")
+                            else:
+                                body_html = body_resp.text
+                        except Exception:
+                            body_html = body_resp.text
+                    links = re.findall(r'href=["\'](https?://[^"\']+)["\']', body_html)
+                    for raw_link in links:
+                        link = html.unescape(raw_link)
+                        if "shp.ee/dlink" in link or "verify/email-link" in link or "dlink" in link:
+                            logger.info(f"✅ Đã lấy được link xác nhận Shopee từ {full_addr}: {link}")
+                            return link, False
+                seen_ids.add(f"fvia:{msg_id}")
+    except Exception as e:
+        logger.debug(f"Lỗi gọi API fviainboxes.com tìm link: {e}")
+    return "", False
+
+
 def _fetch_shopee_email_link(
     driver: WebDriver,
     tempmail_address: str,
@@ -782,48 +1091,54 @@ def _fetch_shopee_email_link(
     timeout: int = 180,
 ) -> str:
     """
-    Lấy link xác nhận (Verify by Email Link) của Shopee từ mail.nguyenmaucole.io.vn.
+    Lấy link xác nhận (Verify by Email Link) của Shopee từ @nguyenmaucole.io.vn hoặc @fviainboxes.com.
     Ví dụ: <a href="https://ph.shp.ee/dlink/..." ...>here</a> to confirm.
     """
     addr = tempmail_address.strip().lower()
-    api_url = f"https://tempmail-backend.thincole.workers.dev/api/emails?address={addr}"
+    prefix, dom = addr.split("@", 1) if "@" in addr else (addr, "nguyenmaucole.io.vn")
+    is_fvia_primary = "fvia" in dom or "dropinboxes" in dom
+    fvia_dom = dom if is_fvia_primary else "fviainboxes.com"
     if seen_ids is None:
         seen_ids = set()
 
     logger.info(f"Đang chờ link xác nhận Shopee gửi về {addr} (tối đa {timeout}s)...")
     start_time = time.time()
+    fvia_blocked = False
 
     while time.time() - start_time < timeout:
         check_browser_alive(driver)
-        try:
-            req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode("utf-8", errors="ignore"))
-
-            if isinstance(data, list):
-                for m in data:
-                    if not isinstance(m, dict):
-                        continue
-                    msg_id = m.get("id")
-                    if msg_id in seen_ids:
-                        continue
-                    subj = (m.get("subject") or "").lower()
-                    sender = (m.get("sender") or "").lower()
-                    if "shopee" in subj or "shopee" in sender or "verification" in subj or "password" in subj:
-                        body_html = m.get("body_html") or ""
-                        # Ưu tiên tìm link chứa dlink hoặc verify/email-link
-                        links = re.findall(r'href=["\'](https?://[^"\']+)["\']', body_html)
-                        for link in links:
-                            if "shp.ee/dlink" in link or "verify/email-link" in link or "dlink" in link:
-                                logger.info(f"✅ Đã lấy được link xác nhận Shopee: {link}")
-                                return link
-        except Exception as e:
-            logger.debug(f"Lỗi gọi API tempmail tìm link: {e}")
+        if is_fvia_primary:
+            if not fvia_blocked:
+                link, blocked = _check_fvia_for_shopee_link(prefix, fvia_dom, seen_ids)
+                if link:
+                    return link
+                if blocked:
+                    fvia_blocked = True
+                    if time.time() - start_time >= 8:
+                        ui_link = _fetch_fvia_browser_content(driver, prefix, fvia_dom, mode="link")
+                        if ui_link:
+                            return ui_link
+            link_alt = _check_nmc_for_shopee_link(prefix, seen_ids)
+            if link_alt:
+                return link_alt
+        else:
+            link = _check_nmc_for_shopee_link(prefix, seen_ids)
+            if link:
+                return link
+            if not fvia_blocked:
+                link_alt, blocked = _check_fvia_for_shopee_link(prefix, fvia_dom, seen_ids)
+                if link_alt:
+                    return link_alt
+                if blocked:
+                    fvia_blocked = True
 
         elapsed = int(time.time() - start_time)
         if elapsed > 0 and elapsed % 9 == 0:
             logger.info(f"Đang chờ email chứa link xác nhận Shopee tại {addr}... ({elapsed}s/{timeout}s)")
         time.sleep(3)
+
+    if is_fvia_primary:
+        return _fetch_fvia_browser_content(driver, prefix, fvia_dom, mode="link")
 
     return ""
 
@@ -889,12 +1204,13 @@ def change_shopee_password(
     shopee_url: str,
     new_shopee_password: str,
     hotmail_email: str,
+    forwarding_domain: str = "nguyenmaucole.io.vn",
 ) -> bool:
     """
     Bước 6: Đổi mật khẩu Shopee:
     1. Truy cập https://shopee.ph/user/account/password (hoặc domain tương ứng).
     2. Nếu hiện Security check -> click 'Verify by Email Link'.
-    3. Lấy link xác nhận từ <prefix>@nguyenmaucole.io.vn -> mở link trong tab mới để approve.
+    3. Lấy link xác nhận từ <prefix>@<forwarding_domain> -> mở link trong tab mới để approve.
     4. Quay lại tab chính (tự chuyển về /user/account/password), điền mật khẩu mới Shopee vào
        ô New Password + Confirm Password -> click Confirm.
     """
@@ -915,11 +1231,19 @@ def change_shopee_password(
         _enable_shopee_antibot_bypass(driver)
 
         email_prefix = (hotmail_email or "").split("@")[0].strip().lower()
-        tempmail_address = f"{email_prefix}@nguyenmaucole.io.vn" if email_prefix else ""
+        fwd_dom = (forwarding_domain or "nguyenmaucole.io.vn").strip().lstrip("@").lower()
+        tempmail_address = f"{email_prefix}@{fwd_dom}" if email_prefix else ""
         seen_ids = _get_existing_tempmail_ids(tempmail_address) if tempmail_address else set()
 
         is_my_or_id = "shopee.com.my" in base_domain.lower() or "shopee.co.id" in base_domain.lower()
-        driver.get(password_url)
+        try:
+            driver.get(password_url)
+        except TimeoutException:
+            logger.warning(f"Trang {password_url} tải chậm quá timeout -> dừng nạp phụ và tiếp tục kiểm tra...")
+            try:
+                driver.execute_script("window.stop();")
+            except Exception:
+                pass
         time.sleep(5)
         wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
         if is_my_or_id:
@@ -1066,15 +1390,16 @@ def _register_affiliate(
     driver: WebDriver, affiliate_url: str, fb_profile_url: str,
     fb_uid: str, fb_password: str, region_name: str,
     hotmail_email: str = "",
+    forwarding_domain: str = "nguyenmaucole.io.vn",
 ) -> Tuple[str, str]:
     """
     Đăng ký Shopee Affiliate:
     1. Truy cập trang affiliate
     2. Click "+ Add" Facebook → xử lý popup FB OAuth (Continue as... → Next)
     3. Điền link FB vào hộp thoại "Add Facebook" → click Confirm
-    4. Điền số điện thoại 84xxxxxxxx → click "Verify & Submit"
+    4. Điền số điện thoại → click "Verify & Submit"
     5. Chọn "Verify with Email" → click "Confirm"
-    6. Lấy mã OTP từ <prefix>@nguyenmaucole.io.vn → điền mã → click "Next"
+    6. Lấy mã OTP từ <prefix>@<forwarding_domain> → điền mã → click "Next"
     7. Vào /account_setting lấy Username và Affiliate ID.
     """
     logger.info(f"=== Đăng ký Affiliate {region_name} ===")
@@ -1083,7 +1408,14 @@ def _register_affiliate(
         _enable_shopee_antibot_bypass(driver)
         # 1. Truy cập trang affiliate
         logger.info(f"Truy cập ngay trang Affiliate: {affiliate_url}")
-        driver.get(affiliate_url)
+        try:
+            driver.get(affiliate_url)
+        except TimeoutException:
+            logger.warning(f"Trang Affiliate ({affiliate_url}) tải chậm quá timeout -> dừng nạp tài nguyên phụ và tiếp tục...")
+            try:
+                driver.execute_script("window.stop();")
+            except Exception:
+                pass
         time.sleep(4)
         wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
         time.sleep(2)
@@ -1407,7 +1739,8 @@ def _register_affiliate(
 
         # 7. Xử lý popup "Select verification method" → chọn "Verify with Email" → click "Confirm"
         email_prefix = (contact_email or hotmail_email).split("@")[0].strip().lower()
-        tempmail_address = f"{email_prefix}@nguyenmaucole.io.vn" if email_prefix else ""
+        fwd_dom = (forwarding_domain or "nguyenmaucole.io.vn").strip().lstrip("@").lower()
+        tempmail_address = f"{email_prefix}@{fwd_dom}" if email_prefix else ""
         seen_ids = _get_existing_tempmail_ids(tempmail_address) if tempmail_address else set()
 
         verify_email_selectors = [
@@ -1820,6 +2153,7 @@ def register_shopee_affiliate(
     fb_password: str,
     region_name: str = "Shopee.PH",
     hotmail_email: str = "",
+    forwarding_domain: str = "nguyenmaucole.io.vn",
 ) -> Tuple[bool, str, str]:
     """
     Bước 5: Đăng ký Shopee Affiliate theo thị trường đã chọn ở Bước 2.
@@ -1841,7 +2175,14 @@ def register_shopee_affiliate(
             return False, "", ""
 
         username, affiliate_id = _register_affiliate(
-            driver, affiliate_url, fb_profile_url, fb_uid, fb_password, region_name, hotmail_email
+            driver,
+            affiliate_url,
+            fb_profile_url,
+            fb_uid,
+            fb_password,
+            region_name,
+            hotmail_email,
+            forwarding_domain,
         )
         if username or affiliate_id:
             return True, username, affiliate_id
@@ -1864,6 +2205,7 @@ def login_shopee_via_facebook(
     region_name: str = "Shopee",
     new_shopee_password: str = "",
     hotmail_email: str = "",
+    forwarding_domain: str = "nguyenmaucole.io.vn",
 ) -> Tuple[bool, str, str]:
     """
     Hàm tương thích gộp cả Login Shopee bằng Facebook + Đăng ký Shopee Affiliate.
@@ -1871,4 +2213,4 @@ def login_shopee_via_facebook(
     ok = login_shopee_account_via_facebook(driver, fb_uid, fb_password, shopee_url, region_name)
     if not ok:
         return False, "", ""
-    return register_shopee_affiliate(driver, fb_uid, fb_password, region_name, hotmail_email)
+    return register_shopee_affiliate(driver, fb_uid, fb_password, region_name, hotmail_email, forwarding_domain)

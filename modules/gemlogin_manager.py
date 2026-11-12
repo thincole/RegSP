@@ -416,7 +416,7 @@ def connect_selenium(profile_info: Dict) -> webdriver.Chrome:
             driver = webdriver.Chrome(options=chrome_options)
 
         try:
-            driver.command_executor._client_config.timeout = 30
+            driver.command_executor._client_config.timeout = 90
         except Exception:
             pass
         driver.set_page_load_timeout(config.PAGE_LOAD_TIMEOUT)

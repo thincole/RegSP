@@ -82,6 +82,8 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
         if region not in shopee_urls:
             region = 'Shopee.PH'
         shopee_url = shopee_urls.get(region, 'https://shopee.ph/buyer/login')
+        rec_target_domain = (gui_config.get('HOTMAIL_RECOVERY_DOMAIN') or 'nguyenmaucole.io.vn').strip().lstrip('@').lower()
+        fwd_target_domain = (gui_config.get('HOTMAIL_FORWARDING_DOMAIN') or 'nguyenmaucole.io.vn').strip().lstrip('@').lower()
 
         # Bước 1: Login Facebook
         if 1 in selected_steps and not stop_flag.is_set():
@@ -102,6 +104,8 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
                     parsed.get('hotmail_password', ''),
                     parsed.get('recovery_email', ''),
                     new_hotmail_pass,
+                    rec_target_domain,
+                    fwd_target_domain,
                 )
             except BrowserClosedError:
                 raise
@@ -178,10 +182,12 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
             if hot_ok:
                 logger.info(f"Dòng {row_index} ({profile_name}): Login Hotmail thành công.")
 
-                # 3a. Thay mail khôi phục về @nguyenmaucole.io.vn TRƯỚC (cùng trang account.live.com/proofs/Manage/additional)
+                # 3a. Thay mail khôi phục về @<rec_target_domain> TRƯỚC (cùng trang account.live.com/proofs/Manage/additional)
                 if want_change_recovery and not stop_flag.is_set():
                     check_browser_alive(driver)
-                    logger.info(f"Dòng {row_index} ({profile_name}): Tiến hành kiểm tra / thay mail khôi phục Hotmail về @nguyenmaucole.io.vn...")
+                    logger.info(
+                        f"Dòng {row_index} ({profile_name}): Tiến hành kiểm tra / thay mail khôi phục Hotmail về @{rec_target_domain}..."
+                    )
                     try:
                         rec_ok = replace_hotmail_recovery_email(
                             driver,
@@ -189,6 +195,7 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
                             recovery_email,
                             parsed.get('hotmail_password', ''),
                             new_hotmail_pass,
+                            target_domain=rec_target_domain,
                         )
                     except BrowserClosedError:
                         raise
@@ -200,7 +207,7 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
 
                     if rec_ok:
                         email_prefix = parsed['hotmail_email'].split('@')[0].strip().lower()
-                        recovery_email = f"{email_prefix}@nguyenmaucole.io.vn"
+                        recovery_email = f"{email_prefix}@{rec_target_domain}"
                         logger.info(f"Dòng {row_index} ({profile_name}): Hoàn tất kiểm tra / thay mail khôi phục Hotmail ({recovery_email}).")
                     else:
                         logger.error(f"Dòng {row_index} ({profile_name}): Thay mail khôi phục Hotmail thất bại.")
@@ -228,13 +235,13 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
             else:
                 logger.error(f"Dòng {row_index} ({profile_name}): Login Hotmail thất bại.")
 
-        # Bước 4: Thêm Email forwarding (@nguyenmaucole.io.vn)
+        # Bước 4: Thêm Email forwarding (@nguyenmaucole.io.vn hoặc @fviainboxes.com)
         if 4 in selected_steps and not stop_flag.is_set():
             check_browser_alive(driver)
             if 3 in selected_steps and not hot_ok:
                 logger.warning(f"Dòng {row_index} ({profile_name}): Bỏ qua Bước 4 (Forwarding) vì Login Hotmail thất bại.")
             else:
-                logger.info(f"Dòng {row_index} ({profile_name}): Bắt đầu Bước 4 - Thêm Email forwarding về @nguyenmaucole.io.vn")
+                logger.info(f"Dòng {row_index} ({profile_name}): Bắt đầu Bước 4 - Thêm Email forwarding về @{fwd_target_domain}")
                 try:
                     fwd_email = setup_hotmail_forwarding(
                         driver,
@@ -242,6 +249,7 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
                         recovery_email,
                         new_hotmail_pass,
                         parsed.get('hotmail_password', ''),
+                        target_domain=fwd_target_domain,
                     )
                 except BrowserClosedError:
                     raise
@@ -255,7 +263,7 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
                     fwd_str = (
                         fwd_email
                         if isinstance(fwd_email, str)
-                        else f"{parsed['hotmail_email'].split('@')[0].strip()}@nguyenmaucole.io.vn"
+                        else f"{parsed['hotmail_email'].split('@')[0].strip().lower()}@{fwd_target_domain}"
                     )
                     col_h = getattr(config, 'COL_FORWARD_EMAIL', 'H')
                     write_cell(sheet_url, sheet_name, row_index, col_h, fwd_str, sa_file)
@@ -278,6 +286,7 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
                     parsed['fb_password'],
                     region,
                     parsed.get('hotmail_email', ''),
+                    fwd_target_domain,
                 )
                 if isinstance(res, tuple):
                     aff_ok, aff_username, aff_id = res
@@ -323,6 +332,7 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
                     shopee_url,
                     new_shopee_pass,
                     parsed.get('hotmail_email', ''),
+                    fwd_target_domain,
                 )
             except BrowserClosedError:
                 raise

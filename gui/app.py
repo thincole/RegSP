@@ -34,7 +34,7 @@ class AutoLoginApp:
         self.root = root
         app_ver = config.get_app_version() if hasattr(config, "get_app_version") else getattr(config, "APP_VERSION", "V 1.0.1")
         self.root.title(f"Auto Login & Register Tool - {app_ver}")
-        self.root.geometry("620x660")
+        self.root.geometry("760x660")
         
         self.stop_flag = threading.Event()
         self.processing_thread = None
@@ -143,9 +143,10 @@ class AutoLoginApp:
         ).pack(side=tk.LEFT, padx=6)
         row_idx += 1
         
-        # Bước 3: Login Hotmail và đổi password Hotmail (+ tuỳ chọn Thay mail khôi phục về @nguyenmaucole.io.vn)
+        # Bước 3: Login Hotmail và đổi password Hotmail (+ tuỳ chọn Thay mail khôi phục về @nguyenmaucole.io.vn hoặc @fviainboxes.com)
         self.cb_vars[3] = tk.BooleanVar(value=False)
         self.hotmail_change_recovery_var = tk.BooleanVar(value=False)
+        self.hotmail_recovery_domain_var = tk.StringVar(value="nguyenmaucole.io.vn")
         hotmail_row_frame = ttk.Frame(main_frame)
         hotmail_row_frame.grid(row=row_idx, column=0, columnspan=3, sticky=tk.W, pady=2)
         ttk.Checkbutton(
@@ -155,19 +156,46 @@ class AutoLoginApp:
         ).pack(side=tk.LEFT)
         ttk.Checkbutton(
             hotmail_row_frame,
-            text="Thay mail khôi phục về @nguyenmaucole.io.vn",
+            text="Thay mail khôi phục về:",
             variable=self.hotmail_change_recovery_var,
             command=self._on_hotmail_change_recovery,
-        ).pack(side=tk.LEFT, padx=(16, 0))
+        ).pack(side=tk.LEFT, padx=(14, 4))
+        ttk.Radiobutton(
+            hotmail_row_frame,
+            text="@nguyenmaucole.io.vn",
+            variable=self.hotmail_recovery_domain_var,
+            value="nguyenmaucole.io.vn",
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(
+            hotmail_row_frame,
+            text="@fviainboxes.com",
+            variable=self.hotmail_recovery_domain_var,
+            value="fviainboxes.com",
+        ).pack(side=tk.LEFT, padx=4)
         row_idx += 1
 
-        # Bước 4: Thêm Email forwarding
+        # Bước 4: Thêm Email forwarding (chọn @nguyenmaucole.io.vn hoặc @fviainboxes.com)
         self.cb_vars[4] = tk.BooleanVar(value=False)
+        self.hotmail_forwarding_domain_var = tk.StringVar(value="nguyenmaucole.io.vn")
+        forwarding_row_frame = ttk.Frame(main_frame)
+        forwarding_row_frame.grid(row=row_idx, column=0, columnspan=3, sticky=tk.W, pady=2)
         ttk.Checkbutton(
-            main_frame,
-            text="4. Thêm Email forwarding (@nguyenmaucole.io.vn)",
+            forwarding_row_frame,
+            text="4. Thêm Email forwarding về:",
             variable=self.cb_vars[4],
-        ).grid(row=row_idx, column=0, columnspan=3, sticky=tk.W, pady=2)
+        ).pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            forwarding_row_frame,
+            text="@nguyenmaucole.io.vn",
+            variable=self.hotmail_forwarding_domain_var,
+            value="nguyenmaucole.io.vn",
+        ).pack(side=tk.LEFT, padx=6)
+        ttk.Radiobutton(
+            forwarding_row_frame,
+            text="@fviainboxes.com",
+            variable=self.hotmail_forwarding_domain_var,
+            value="fviainboxes.com",
+        ).pack(side=tk.LEFT, padx=6)
         row_idx += 1
         
         # Bước 5: Reg aff Shopee theo thị trường chọn ở bước 2
@@ -265,8 +293,14 @@ class AutoLoginApp:
                 self.cb_vars[3].set(True)
             if settings.get("cb_hotmail_change_recovery"):
                 self.hotmail_change_recovery_var.set(True)
+            rec_dom = settings.get("hotmail_recovery_domain")
+            if rec_dom in ("nguyenmaucole.io.vn", "fviainboxes.com"):
+                self.hotmail_recovery_domain_var.set(rec_dom)
             if settings.get("cb_forwarding"):
                 self.cb_vars[4].set(True)
+            fwd_dom = settings.get("hotmail_forwarding_domain")
+            if fwd_dom in ("nguyenmaucole.io.vn", "fviainboxes.com"):
+                self.hotmail_forwarding_domain_var.set(fwd_dom)
             if "cb_shopee_aff" in settings:
                 self.cb_vars[5].set(bool(settings.get("cb_shopee_aff")))
             if settings.get("cb_shopee_pass"):
@@ -306,7 +340,9 @@ class AutoLoginApp:
             "shopee_market": self.shopee_region_var.get(),
             "cb_hotmail": self.cb_vars[3].get(),
             "cb_hotmail_change_recovery": self.hotmail_change_recovery_var.get(),
+            "hotmail_recovery_domain": self.hotmail_recovery_domain_var.get(),
             "cb_forwarding": self.cb_vars[4].get(),
+            "hotmail_forwarding_domain": self.hotmail_forwarding_domain_var.get(),
             "cb_shopee_aff": self.cb_vars[5].get(),
             "cb_shopee_pass": self.cb_vars[6].get(),
         }
@@ -372,6 +408,8 @@ class AutoLoginApp:
             'FB_NO_COOKIE': self.fb_no_cookie_var.get(),
             'SHOPEE_REGION': self.shopee_region_var.get(),
             'HOTMAIL_CHANGE_RECOVERY': self.hotmail_change_recovery_var.get(),
+            'HOTMAIL_RECOVERY_DOMAIN': self.hotmail_recovery_domain_var.get(),
+            'HOTMAIL_FORWARDING_DOMAIN': self.hotmail_forwarding_domain_var.get(),
         }
 
     def update_progress(self, current, total):
