@@ -16,6 +16,7 @@ import re
 import time
 import zipfile
 import threading
+import urllib.parse
 import urllib.request
 from typing import Optional, Dict
 
@@ -205,6 +206,78 @@ def _disable_save_password_popup(profile_id: str) -> None:
         logger.debug(f"Không thể cập nhật Preferences cho profile {profile_id}: {e}")
 
 
+_gemcaptcha_initialized = False
+
+
+def _ensure_gemcaptcha_extension() -> str:
+    """
+    Đảm bảo extension GemCaptcha (trong thư mục extensions/gemcaptcha) đã được điền sẵn API Key
+    và tự động đăng ký vào ~/.gemlogin/extensions/extension.json để Gemlogin nạp tự động cho mọi profile.
+    Trả về đường dẫn tuyệt đối tới thư mục extension (nếu tồn tại).
+    """
+    global _gemcaptcha_initialized
+    ext_dir = getattr(
+        config,
+        "GEMCAPTCHA_EXTENSION_DIR",
+        os.path.join(config.APP_DIR, "extensions", "gemcaptcha"),
+    )
+    ext_dir = os.path.normpath(ext_dir)
+    if not os.path.isdir(ext_dir):
+        return ""
+
+    if _gemcaptcha_initialized:
+        return ext_dir
+
+    api_key = getattr(config, "GEMCAPTCHA_API_KEY", "").strip()
+    try:
+        # 1. Cập nhật configs.json của extension với API key hiện tại
+        cfg_file = os.path.join(ext_dir, "configs.json")
+        if os.path.isfile(cfg_file) and api_key:
+            with open(cfg_file, "r", encoding="utf-8") as f:
+                cfg_data = json.load(f)
+            if cfg_data.get("api_key") != api_key or not cfg_data.get("power_on"):
+                cfg_data["api_key"] = api_key
+                cfg_data["power_on"] = True
+                with open(cfg_file, "w", encoding="utf-8") as f:
+                    json.dump(cfg_data, f, indent=2, ensure_ascii=False)
+
+        # 2. Đăng ký vào ~/.gemlogin/extensions/extension.json để Gemlogin nạp tự động
+        gem_ext_json = os.path.join(os.path.expanduser("~"), ".gemlogin", "extensions", "extension.json")
+        if os.path.isfile(gem_ext_json):
+            with open(gem_ext_json, "r", encoding="utf-8") as f:
+                ext_list = json.load(f)
+            if isinstance(ext_list, list):
+                found = False
+                for item in ext_list:
+                    if isinstance(item, dict) and (
+                        item.get("id") == "gemcaptcha_auto_solve"
+                        or "gemcaptcha" in (item.get("name") or "").lower()
+                        or "gemcaptcha" in (item.get("path") or "").lower()
+                    ):
+                        item["path"] = ext_dir
+                        item["disabled"] = False
+                        found = True
+                if not found:
+                    ext_list.append(
+                        {
+                            "id": "gemcaptcha_auto_solve",
+                            "name": "GEMcaptcha: Auto solve captcha",
+                            "path": ext_dir,
+                            "description": "GEMcaptcha: Auto solve captcha",
+                            "disabled": False,
+                            "deletable": True,
+                        }
+                    )
+                with open(gem_ext_json, "w", encoding="utf-8") as f:
+                    json.dump(ext_list, f, ensure_ascii=False)
+                logger.info(f"✅ Đã tích hợp extension GemCaptcha vào Gemlogin: {ext_dir}")
+        _gemcaptcha_initialized = True
+    except Exception as e:
+        logger.debug(f"Lỗi khi cấu hình extension GemCaptcha: {e}")
+
+    return ext_dir
+
+
 @retry(max_retries=2, delay=3.0, exceptions=(ProfileStartError,))
 def start_profile(profile_id: str) -> Dict:
     """
@@ -223,8 +296,13 @@ def start_profile(profile_id: str) -> Dict:
     try:
         with _start_profile_lock:
             _disable_save_password_popup(profile_id)
+            ext_dir = _ensure_gemcaptcha_extension()
+            extra_args = "--disable-save-password-bubble"
+            if ext_dir:
+                ext_forward = ext_dir.replace("\\", "/")
+                extra_args += f" --load-extension={ext_forward}"
             res = _api_get(
-                f"/api/profiles/start/{profile_id}?addination_args=--disable-save-password-bubble",
+                f"/api/profiles/start/{profile_id}?addination_args={urllib.parse.quote(extra_args)}",
                 timeout=30,
             )
             time.sleep(1.5)

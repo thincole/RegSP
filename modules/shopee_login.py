@@ -65,7 +65,7 @@ def _is_shopee_phone_verification(driver: WebDriver) -> bool:
 
 def _wait_for_captcha(driver: WebDriver, timeout: int = None) -> bool:
     """
-    Phát hiện captcha Shopee và chờ người dùng giải bằng tay (mặc định 5 phút = 300s, quét 5s/lần).
+    Phát hiện captcha Shopee và chờ extension GemCaptcha tự động giải (hoặc người dùng giải bằng tay).
     Captcha có text 'Verify to Continue', 'slide to complete the puzzle',
     hoặc URL chứa 'verify/captcha' / 'verify/traffic'.
     Nếu người dùng đóng trình duyệt hoặc xuất hiện 'Mobile Phone Verification' thì thoát ngay lập tức.
@@ -93,6 +93,11 @@ def _wait_for_captcha(driver: WebDriver, timeout: int = None) -> bool:
             for kw in ("verify to continue", "slide to complete", "please slide", "please try again later"):
                 if kw in txt:
                     return True, kw
+            has_dom_captcha = driver.execute_script(
+                "return Boolean(document.querySelector('[id*=\"captchaMask\"], [id*=\"puzzleContainer\"], [id*=\"NEW_CAPTCHA\"]'));"
+            )
+            if has_dom_captcha:
+                return True, "DOM=captchaMask/puzzleContainer"
         except (BrowserClosedError, LoginFailedError):
             raise
         except Exception as e:
@@ -106,33 +111,58 @@ def _wait_for_captcha(driver: WebDriver, timeout: int = None) -> bool:
         if not captcha_found:
             return True
 
-        logger.warning(f"⚠️ CAPTCHA phát hiện! ({matched_reason})")
-        logger.warning("=" * 50)
-        logger.warning(f"⚠️ CAPTCHA! Vui lòng giải captcha bằng tay trên trình duyệt (chờ tối đa {timeout}s, quét {check_interval}s/lần)!")
-        logger.warning("=" * 50)
-
-        try:
-            driver.execute_cdp_cmd("Page.bringToFront", {})
-        except Exception:
-            pass
-        try:
-            import winsound
-            winsound.Beep(1000, 350)
-            winsound.Beep(1300, 350)
-        except Exception:
-            pass
+        logger.warning(f"⚠️ CAPTCHA Shopee phát hiện! ({matched_reason}) -> Đang chờ GemCaptcha tự động giải...")
 
         start_time = time.time()
+        alerted_manual = False
+        last_gem_msg = ""
+
         while time.time() - start_time < timeout:
-            time.sleep(check_interval)
+            elapsed = int(time.time() - start_time)
+            # Trong 30s đầu quét nhanh 2s/lần để đợi extension GemCaptcha tự kéo giải
+            poll_sleep = 2 if elapsed < 30 else check_interval
+            time.sleep(poll_sleep)
+
             still_visible, reason = _is_captcha_present()
-            if still_visible:
-                elapsed = int(time.time() - start_time)
-                logger.info(f"⏳ Đang chờ giải captcha... ({elapsed}s / {timeout}s) [{reason}]")
-            else:
-                logger.info("✅ Captcha đã được giải! Tiếp tục sang bước tiếp theo...")
+            if not still_visible:
+                logger.info("✅ Captcha Shopee đã được giải thành công! Tiếp tục sang bước tiếp theo...")
                 time.sleep(1)
                 return True
+
+            try:
+                gem_msg = (
+                    driver.execute_script(
+                        "const el = document.getElementById('captcha-message'); return el ? el.innerText : '';"
+                    )
+                    or ""
+                ).strip()
+                if gem_msg and gem_msg != last_gem_msg:
+                    last_gem_msg = gem_msg
+                    logger.info(f"🤖 {gem_msg}")
+            except Exception:
+                gem_msg = ""
+
+            elapsed = int(time.time() - start_time)
+            if elapsed >= 30 and not alerted_manual:
+                alerted_manual = True
+                logger.warning("=" * 50)
+                logger.warning(
+                    f"⚠️ Captcha chưa qua sau 30s! Vui lòng kiểm tra trên trình duyệt (chờ tối đa {timeout}s)!"
+                )
+                logger.warning("=" * 50)
+                try:
+                    driver.execute_cdp_cmd("Page.bringToFront", {})
+                except Exception:
+                    pass
+                try:
+                    import winsound
+                    winsound.Beep(1000, 350)
+                    winsound.Beep(1300, 350)
+                except Exception:
+                    pass
+
+            if elapsed >= 30 or not gem_msg:
+                logger.info(f"⏳ Đang chờ giải captcha... ({elapsed}s / {timeout}s) [{reason}]")
 
         logger.error(f"⏰ Hết thời gian chờ captcha ({timeout}s)")
         return False
@@ -259,6 +289,7 @@ def _click_facebook_login_button(driver: WebDriver) -> bool:
     """
     logger.info("Đang tìm nút 'Facebook' trên Shopee Login...")
 
+    _wait_for_captcha(driver)
     _select_shopee_english_language(driver)
 
     if _is_shopee_captcha_or_blocked(driver) or _check_shopee_logged_in_user(driver):
@@ -1543,13 +1574,14 @@ def _check_shopee_logged_in_user(driver: WebDriver) -> str:
 
 def _is_shopee_captcha_or_blocked(driver: WebDriver) -> bool:
     """
-    Kiểm tra xem trang Shopee hiện tại có đang ở màn hình Captcha ('verify/captcha', 'verify/traffic')
+    Kiểm tra xem trang Shopee hiện tại có đang ở màn hình chặn traffic ('verify/traffic')
     hoặc thông báo 'Please Try Again Later' / 'Verification can't be completed' hay không.
+    (Riêng 'verify/captcha' có hình kéo mảnh ghép sẽ để GemCaptcha tự động giải qua _wait_for_captcha).
     """
     driver.implicitly_wait(0)
     try:
         cur_url = (driver.current_url or "").lower()
-        if "verify/captcha" in cur_url or "verify/traffic" in cur_url:
+        if "verify/traffic" in cur_url:
             return True
         body_txt = (driver.execute_script("return document.body ? document.body.innerText : '';") or "").lower()
         if "please try again later" in body_txt or "verification can't be completed" in body_txt:
@@ -1667,9 +1699,14 @@ def login_shopee_account_via_facebook(
                 if _is_shopee_phone_verification(driver):
                     logger.warning("⚠️ Phát hiện màn hình 'Mobile Phone Verification' trên Shopee -> Bỏ qua luồng này!")
                     raise LoginFailedError("Shopee yêu cầu xác minh SĐT (Mobile Phone Verification)")
+                # Nếu sau khi bấm nút Facebook mà Shopee bật Captcha kéo hình trước khi mở popup FB -> chờ GemCaptcha giải
+                if not (set(driver.window_handles) - handles_before_click):
+                    _wait_for_captcha(driver)
+                    if not (set(driver.window_handles) - handles_before_click) and "buyer/login" in (driver.current_url or "").lower():
+                        _click_facebook_login_button(driver)
                 if _is_shopee_captcha_or_blocked(driver):
                     logger.info(
-                        "⚠️ Phát hiện Captcha / 'Please Try Again Later' sau khi bấm FB -> Thử đăng nhập qua trang Affiliate..."
+                        "⚠️ Phát hiện 'Please Try Again Later' sau khi bấm FB -> Thử đăng nhập qua trang Affiliate..."
                     )
                     need_affiliate_fallback = True
                 else:

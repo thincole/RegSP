@@ -57,10 +57,15 @@ MS_TOKEN_INDEX = 7            # Microsoft Token
 UUID_INDEX = 8                # UUID
 
 # ============================================================
-# GEMLOGIN API
+# GEMLOGIN & GEMCAPTCHA API
 # ============================================================
 GEMLOGIN_API_PORT = int(os.getenv("GEMLOGIN_API_PORT", "1010"))
 GEMLOGIN_API_BASE = f"http://localhost:{GEMLOGIN_API_PORT}/api/v3"
+GEMCAPTCHA_API_KEY = os.getenv(
+    "GEMCAPTCHA_API_KEY",
+    "GEM_IIXATPHUNM8DESMJV53GWNVQYEDAQ0M0X0TNK9KGPKDEGM1HNJKHZI83AFNUKG1778167636",
+)
+GEMCAPTCHA_EXTENSION_DIR = os.path.join(APP_DIR, "extensions", "gemcaptcha")
 
 # ============================================================
 # TIMING & THREADS (giây)
