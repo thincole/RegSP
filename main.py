@@ -12,6 +12,7 @@ from modules.hotmail_login import (
     login_hotmail,
     setup_hotmail_forwarding,
     replace_hotmail_recovery_email,
+    set_preferred_recovery_domain,
 )
 from modules.change_password import change_hotmail_password
 from modules.shopee_login import (
@@ -84,6 +85,7 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
         shopee_url = shopee_urls.get(region, 'https://shopee.ph/buyer/login')
         rec_target_domain = (gui_config.get('HOTMAIL_RECOVERY_DOMAIN') or 'nguyenmaucole.io.vn').strip().lstrip('@').lower()
         fwd_target_domain = (gui_config.get('HOTMAIL_FORWARDING_DOMAIN') or 'nguyenmaucole.io.vn').strip().lstrip('@').lower()
+        set_preferred_recovery_domain(rec_target_domain)
 
         # Bước 1: Login Facebook
         if 1 in selected_steps and not stop_flag.is_set():
@@ -170,6 +172,7 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
                     parsed['hotmail_password'],
                     recovery_email,
                     new_hotmail_pass,
+                    target_domain=rec_target_domain,
                 )
             except BrowserClosedError:
                 raise

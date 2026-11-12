@@ -152,7 +152,7 @@ def parse_column_b(raw_string: str) -> Dict[str, Optional[str]]:
         f"Cookie={'CÓ' if fb_cookie else 'KHÔNG'}, "
         f"Email={hotmail_email}, "
         f"HotmailPass={hotmail_password}, "
-        f"Recovery={recovery_email or 'Mặc định (@nguyenmaucole.io.vn)'}"
+        f"Recovery={recovery_email or '(chưa gắn sẵn)'}"
     )
 
     return {

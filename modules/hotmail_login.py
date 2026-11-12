@@ -4,6 +4,7 @@ CHỈ chạy khi Bước 1 (Facebook login) thành công.
 """
 import re
 import time
+import threading
 from typing import Optional
 
 import requests
@@ -48,6 +49,24 @@ BOXNT_DOMAINS = (
 )
 BOXNT_WEB_URL = f"https://{BOXNT_DOMAIN}/"
 BOXNT_API_BASE = f"https://{BOXNT_DOMAIN}/api/v1"
+
+_thread_ctx = threading.local()
+_global_default_recovery_domain = TEMPMAIL_DOMAIN
+
+
+def set_preferred_recovery_domain(domain: str) -> None:
+    """Thiết lập domain khôi phục ưu tiên cho luồng hiện tại (vd: fviainboxes.com hoặc nguyenmaucole.io.vn)."""
+    global _global_default_recovery_domain
+    dom = (domain or TEMPMAIL_DOMAIN).strip().lstrip("@").lower()
+    _thread_ctx.recovery_domain = dom
+    _global_default_recovery_domain = dom
+
+
+def get_preferred_recovery_domain(explicit_domain: str = "") -> str:
+    """Lấy domain khôi phục ưu tiên đã chọn trên GUI."""
+    if explicit_domain and explicit_domain.strip():
+        return explicit_domain.strip().lstrip("@").lower()
+    return getattr(_thread_ctx, "recovery_domain", None) or _global_default_recovery_domain or TEMPMAIL_DOMAIN
 
 
 def _is_fvia_domain(text_or_domain: str) -> bool:
@@ -1118,14 +1137,27 @@ def _fetch_code_from_boxnt(
     return None
 
 
-def _resolve_recovery_email(hotmail_email: str, recovery_email: str, body_text: str) -> str:
+def _resolve_recovery_email(
+    hotmail_email: str,
+    recovery_email: str,
+    body_text: str,
+    preferred_domain: str = "",
+    is_adding_new: bool = False,
+) -> str:
     """
     Xác định email khôi phục cần điền:
+    - Nếu đang ở màn hình 'Help protect your account' -> 'Add an email address' (is_adding_new=True, gắn mới email khôi phục),
+      luôn dùng <prefix>@<preferred_domain> theo lựa chọn trên GUI (@fviainboxes.com hoặc @nguyenmaucole.io.vn).
     - Nếu trang Microsoft chỉ định rõ domain (@boxnt.com, @fviadropinbox.com, @fviamail.work, @fviainboxes.com, @nguyenmaucole.io.vn...) trên màn hình Verify, ưu tiên domain đó.
     - Nếu trong data Cột B có sẵn recovery_email, dùng recovery_email đó.
-    - Ngược lại mặc định dùng <prefix>@nguyenmaucole.io.vn.
+    - Ngược lại dùng <prefix>@<preferred_domain>.
     """
-    prefix = hotmail_email.split("@")[0].strip() if hotmail_email else ""
+    prefix = hotmail_email.split("@")[0].strip().lower() if hotmail_email else ""
+    pref_dom = get_preferred_recovery_domain(preferred_domain)
+
+    if is_adding_new:
+        return f"{prefix}@{pref_dom}"
+
     body_lower = (body_text or "").lower()
 
     for boxnt_dom in BOXNT_DOMAINS:
@@ -1148,12 +1180,15 @@ def _resolve_recovery_email(hotmail_email: str, recovery_email: str, body_text: 
     if recovery_email and "@" in recovery_email:
         return recovery_email.strip()
 
-    return f"{prefix}@{TEMPMAIL_DOMAIN}"
+    return f"{prefix}@{pref_dom}"
 
 
 def _handle_add_recovery_email(
-    driver: WebDriver, hotmail_email: str, recovery_email: str = "",
+    driver: WebDriver,
+    hotmail_email: str,
+    recovery_email: str = "",
     fallback_pass: str = "",
+    preferred_domain: str = "",
 ) -> bool:
     """
     Xử lý màn hình 'Help protect your account', 'Help us protect your account' (identity/confirm), hoặc 'Verify your email':
@@ -1210,9 +1245,12 @@ def _handle_add_recovery_email(
         except Exception:
             pass
 
-    target_recovery_email = _resolve_recovery_email(hotmail_email, recovery_email, body_text)
+    is_adding_new = "help protect your account" in body_lower_init or "add an email" in body_lower_init
+    target_recovery_email = _resolve_recovery_email(
+        hotmail_email, recovery_email, body_text, preferred_domain=preferred_domain, is_adding_new=is_adding_new
+    )
     rec_prefix, rec_domain = target_recovery_email.split("@", 1)
-    rec_prefix = rec_prefix.strip()
+    rec_prefix = rec_prefix.strip().lower()
     rec_domain = rec_domain.strip().lower()
 
     # Trường hợp 0: Nếu màn hình ĐÃ ở sẵn bước nhập 6 ô code hoặc ô #iOttText
@@ -1225,11 +1263,11 @@ def _handle_add_recovery_email(
         code_el = existing_code_boxes[0]
         is_six_boxes = (code_el.get_attribute("id") or "") == "codeEntry-0"
         if _is_fvia_domain(rec_domain):
-            code = _fetch_code_from_fviainboxes(driver, rec_prefix, domain=rec_domain, seen_ids=set(), timeout=60)
+            code = _fetch_code_from_fviainboxes(driver, rec_prefix, domain=rec_domain, seen_ids=set(), timeout=90)
         elif _is_boxnt_domain(rec_domain):
-            code = _fetch_code_from_boxnt(driver, rec_prefix, domain=rec_domain, seen_ids=set(), timeout=60)
+            code = _fetch_code_from_boxnt(driver, rec_prefix, domain=rec_domain, seen_ids=set(), timeout=90)
         else:
-            code = _fetch_code_from_tempmail(driver, rec_prefix, min_id=0, timeout=60)
+            code = _fetch_code_from_tempmail(driver, rec_prefix, min_id=0, timeout=90)
         if not code:
             return False
         if is_six_boxes:
@@ -1261,20 +1299,34 @@ def _handle_add_recovery_email(
         logger.info("✅ Đã xác nhận email khôi phục thành công!")
         return True
 
-    # Bước 1: Nếu đang ở màn hình có nút "Add email", bấm "Add email"
-    if "help protect your account" in body_lower_init or "add an email" in body_lower_init:
+    # Bước 1: Nếu đang ở màn hình có nút "Add email" ('Help protect your account'), bấm "Add email"
+    if "help protect your account" in body_lower_init:
         logger.info("Phát hiện màn hình 'Help protect your account' -> Bấm 'Add email'")
         add_btn_selectors = [
             (By.XPATH, "//button[contains(., 'Add email')]"),
-            (By.CSS_SELECTOR, "button[type='submit']"),
-            (By.ID, "iLandingViewAction"),
+            (By.CSS_SELECTOR, "button[data-testid='primaryButton'], button[type='submit'], #iLandingViewAction"),
         ]
         for by, val in add_btn_selectors:
             btn = wait_for_element(driver, by, val, timeout=3, condition="clickable")
             if btn:
-                safe_click(btn, delay=3.0)
+                if not safe_click(btn, delay=2.5):
+                    driver.execute_script("arguments[0].click();", btn)
+                    time.sleep(2.5)
                 logger.info("Đã click nút 'Add email'")
+                is_adding_new = True
                 break
+        try:
+            body_text = driver.find_element(By.TAG_NAME, "body").text
+            if "add an email" in body_text.lower():
+                is_adding_new = True
+            target_recovery_email = _resolve_recovery_email(
+                hotmail_email, recovery_email, body_text, preferred_domain=preferred_domain, is_adding_new=is_adding_new
+            )
+            rec_prefix, rec_domain = target_recovery_email.split("@", 1)
+            rec_prefix = rec_prefix.strip().lower()
+            rec_domain = rec_domain.strip().lower()
+        except Exception:
+            pass
 
     # Bước 1a: Nếu đang ở màn hình "Help us protect your account" (account.live.com/identity/confirm) có radio button #iProof0
     proof_radios = [
@@ -1289,9 +1341,11 @@ def _handle_add_recovery_email(
             time.sleep(1.5)
         try:
             body_text = driver.find_element(By.TAG_NAME, "body").text
-            target_recovery_email = _resolve_recovery_email(hotmail_email, recovery_email, body_text)
+            target_recovery_email = _resolve_recovery_email(
+                hotmail_email, recovery_email, body_text, preferred_domain=preferred_domain, is_adding_new=False
+            )
             rec_prefix, rec_domain = target_recovery_email.split("@", 1)
-            rec_prefix = rec_prefix.strip()
+            rec_prefix = rec_prefix.strip().lower()
             rec_domain = rec_domain.strip().lower()
         except Exception:
             pass
@@ -1322,15 +1376,30 @@ def _handle_add_recovery_email(
             logger.info("Đã chọn phương thức 'Send a code to ...' / xác minh qua Email khôi phục")
             try:
                 body_text = driver.find_element(By.TAG_NAME, "body").text
-                target_recovery_email = _resolve_recovery_email(hotmail_email, recovery_email, body_text)
+                target_recovery_email = _resolve_recovery_email(
+                    hotmail_email, recovery_email, body_text, preferred_domain=preferred_domain, is_adding_new=False
+                )
                 rec_prefix, rec_domain = target_recovery_email.split("@", 1)
-                rec_prefix = rec_prefix.strip()
+                rec_prefix = rec_prefix.strip().lower()
                 rec_domain = rec_domain.strip().lower()
             except Exception:
                 pass
 
     # Bước 2: Chờ màn hình nhập địa chỉ email khôi phục (hoặc nếu đã chuyển thẳng sang ô nhập 6 số code)
     time.sleep(1)
+    try:
+        body_now = (driver.find_element(By.TAG_NAME, "body").text or "")
+        if "add an email" in body_now.lower():
+            is_adding_new = True
+            target_recovery_email = _resolve_recovery_email(
+                hotmail_email, recovery_email, body_now, preferred_domain=preferred_domain, is_adding_new=True
+            )
+            rec_prefix, rec_domain = target_recovery_email.split("@", 1)
+            rec_prefix = rec_prefix.strip().lower()
+            rec_domain = rec_domain.strip().lower()
+    except Exception:
+        pass
+
     min_mail_id = 0
     fvia_seen_ids = set()
     boxnt_seen_ids = set()
@@ -1341,14 +1410,13 @@ def _handle_add_recovery_email(
     else:
         min_mail_id = _get_latest_tempmail_id(rec_prefix)
 
-    email_inp = None
-    inp_selectors = [
-        (By.CSS_SELECTOR, "#iProofEmail, #proof-confirmation-email-input, input[id^='floatingLabelInput']:not([id^='codeEntry']), input[type='email'], #EmailAddress"),
-    ]
-    for by, val in inp_selectors:
-        email_inp = wait_for_element(driver, by, val, timeout=4, condition="visible")
-        if email_inp:
-            break
+    email_inp = wait_for_element(
+        driver,
+        By.CSS_SELECTOR,
+        "#iProofEmail, #proof-confirmation-email-input, input[type='email'], #EmailAddress, input[id^='floatingLabelInput']:not([id^='codeEntry'])",
+        timeout=4,
+        condition="visible",
+    )
 
     if email_inp:
         # Nếu là ô #iProofEmail (trên trang identity/confirm có sẵn hậu tố @domain bên cạnh) -> chỉ điền phần prefix
@@ -1364,19 +1432,66 @@ def _handle_add_recovery_email(
             value_to_type = target_recovery_email
             logger.info(f"Nhập email khôi phục: {value_to_type}")
 
-        safe_send_keys(email_inp, value_to_type, delay=1.0)
+        safe_click(email_inp, delay=0.2)
+        safe_send_keys(email_inp, value_to_type, delay=0.8)
 
         next_btn_selectors = [
-            (By.CSS_SELECTOR, "#iSelectProofAction"),
+            (By.CSS_SELECTOR, "button[data-testid='primaryButton'], #iSelectProofAction, #iNext, button[type='submit'], input[type='submit']"),
             (By.XPATH, "//button[contains(., 'Next') or contains(., 'Send code') or contains(., 'Gửi mã')]"),
-            (By.CSS_SELECTOR, "button[type='submit'], input[type='submit'], #iNext"),
         ]
+        clicked_next = False
         for by, val in next_btn_selectors:
-            next_btn = wait_for_element(driver, by, val, timeout=5, condition="clickable")
+            next_btn = wait_for_element(driver, by, val, timeout=3, condition="clickable")
             if next_btn:
-                safe_click(next_btn, delay=3.0)
+                if not safe_click(next_btn, delay=2.5):
+                    driver.execute_script("arguments[0].click();", next_btn)
+                    time.sleep(2.5)
                 logger.info("Đã click 'Next'/'Send code' để gửi mã xác nhận về email khôi phục")
+                clicked_next = True
                 break
+        if not clicked_next:
+            try:
+                email_inp.send_keys(Keys.RETURN)
+                time.sleep(2.5)
+            except Exception:
+                pass
+
+        # Đảm bảo trang đã chuyển khỏi màn hình 'Add an email address' sang màn hình nhập code
+        driver.implicitly_wait(0)
+        try:
+            for retry_submit in range(6):
+                otp_ready = any(
+                    el.is_displayed()
+                    for el in driver.find_elements(
+                        By.CSS_SELECTOR,
+                        "#codeEntry-0, #iOttText, input[name='otc'], input[name='ottCode'], input[autocomplete='one-time-code']",
+                    )
+                )
+                if otp_ready:
+                    break
+                b_after = (driver.find_element(By.TAG_NAME, "body").text or "").lower()
+                if "add an email address" not in b_after and "enter your email" not in b_after:
+                    break
+                if retry_submit == 2:
+                    btns_retry = [
+                        b for b in driver.find_elements(
+                            By.CSS_SELECTOR,
+                            "button[data-testid='primaryButton'], button[type='submit'], #iSelectProofAction, #iNext",
+                        )
+                        if b.is_displayed()
+                    ]
+                    if btns_retry:
+                        driver.execute_script("arguments[0].click();", btns_retry[0])
+                    else:
+                        try:
+                            email_inp.send_keys(Keys.RETURN)
+                        except Exception:
+                            pass
+                time.sleep(1.0)
+        except Exception:
+            pass
+        finally:
+            driver.implicitly_wait(5)
     else:
         # Kiểm tra xem có phải đã chuyển thẳng sang màn hình nhập code 6 số không
         direct_code_boxes = [
@@ -1390,14 +1505,24 @@ def _handle_add_recovery_email(
         boxnt_seen_ids = set()
         min_mail_id = 0
 
-    # Bước 3: Chờ ô nhập code 6 số xuất hiện (6 ô codeEntry-0..5 hoặc 1 ô đơn #iOttText)
+    # Bước 3: Chờ ô nhập code 6 số xuất hiện (6 ô codeEntry-0..5 hoặc 1 ô đơn #iOttText / ottCode) — tuyệt đối không bắt nhầm input[type='email']
     code_el = wait_for_element(
         driver,
         By.CSS_SELECTOR,
-        "#codeEntry-0, #iOttText, input[name='otc'], input[type='tel'], input[type='number'], input[id^='floatingLabelInput'], input[type='text']",
-        timeout=10,
+        "#codeEntry-0, #iOttText, input[name='otc'], input[name='ottCode'], input[autocomplete='one-time-code'], input[type='tel'], input[type='number']",
+        timeout=12,
         condition="visible",
     )
+    if not code_el:
+        code_el = wait_for_element(
+            driver,
+            By.CSS_SELECTOR,
+            "input[type='text']:not([type='email']):not([name='loginfmt'])",
+            timeout=3,
+            condition="visible",
+        )
+        if code_el and "@" in (code_el.get_attribute("value") or ""):
+            code_el = None
     if not code_el:
         logger.error("Không tìm thấy ô nhập mã xác nhận trên trang Microsoft")
         return False
@@ -1406,11 +1531,11 @@ def _handle_add_recovery_email(
 
     # Lấy code từ fviainboxes.com, boxnt.com, hoặc mail.nguyenmaucole.io.vn
     if _is_fvia_domain(rec_domain):
-        code = _fetch_code_from_fviainboxes(driver, rec_prefix, domain=rec_domain, seen_ids=fvia_seen_ids, timeout=60)
+        code = _fetch_code_from_fviainboxes(driver, rec_prefix, domain=rec_domain, seen_ids=fvia_seen_ids, timeout=90)
     elif _is_boxnt_domain(rec_domain):
-        code = _fetch_code_from_boxnt(driver, rec_prefix, domain=rec_domain, seen_ids=boxnt_seen_ids, timeout=60)
+        code = _fetch_code_from_boxnt(driver, rec_prefix, domain=rec_domain, seen_ids=boxnt_seen_ids, timeout=90)
     else:
-        code = _fetch_code_from_tempmail(driver, rec_prefix, min_id=min_mail_id, timeout=60)
+        code = _fetch_code_from_tempmail(driver, rec_prefix, min_id=min_mail_id, timeout=90)
 
     if not code:
         return False
@@ -1454,7 +1579,7 @@ def _handle_add_recovery_email(
 
 def handle_microsoft_prompts(
     driver: WebDriver, hotmail_email: str, recovery_email: str = "",
-    current_password: str = "",
+    current_password: str = "", preferred_domain: str = "",
 ) -> None:
     """
     Xử lý chuỗi các màn hình trung gian của Microsoft sau khi đăng nhập:
@@ -1557,7 +1682,9 @@ def handle_microsoft_prompts(
                 or "help us protect your account" in body_lower
                 or "add an email address" in body_lower
             ):
-                if not _handle_add_recovery_email(driver, hotmail_email, recovery_email, fallback_pass=primary_pwd):
+                if not _handle_add_recovery_email(
+                    driver, hotmail_email, recovery_email, fallback_pass=primary_pwd, preferred_domain=preferred_domain
+                ):
                     break
                 continue
 
@@ -1571,7 +1698,9 @@ def handle_microsoft_prompts(
                 or "we need to verify your identity" in body_lower
             ):
                 logger.info("Phát hiện màn hình xác minh danh tính ('Almost there' / 'Verify your email')...")
-                if not _handle_add_recovery_email(driver, hotmail_email, recovery_email, fallback_pass=primary_pwd):
+                if not _handle_add_recovery_email(
+                    driver, hotmail_email, recovery_email, fallback_pass=primary_pwd, preferred_domain=preferred_domain
+                ):
                     break
                 continue
 
@@ -2380,7 +2509,8 @@ def replace_hotmail_recovery_email(
         return False
 
     prefix = hotmail_email.split("@")[0].strip().lower()
-    target_dom = (target_domain or TEMPMAIL_DOMAIN).strip().lstrip("@").lower()
+    target_dom = get_preferred_recovery_domain(target_domain)
+    set_preferred_recovery_domain(target_dom)
     new_rec_email = f"{prefix}@{target_dom}"
 
     if recovery_email and recovery_email.strip().lower() == new_rec_email:
@@ -2461,6 +2591,7 @@ def replace_hotmail_recovery_email(
                 hotmail_email,
                 recovery_email,
                 current_password=new_hotmail_pass or current_password,
+                preferred_domain=target_dom,
             )
             if "proofs/manage" not in (driver.current_url or "").lower():
                 driver.get(manage_url)
@@ -2809,6 +2940,7 @@ def replace_hotmail_recovery_email(
 def login_hotmail(
     driver: WebDriver, hotmail_email: str, hotmail_password: str,
     recovery_email: str = "", new_hotmail_pass: str = "",
+    target_domain: str = "",
 ) -> bool:
     """
     Đăng nhập Hotmail trên Tab 2.
@@ -2817,7 +2949,9 @@ def login_hotmail(
     Returns:
         True nếu đăng nhập thành công.
     """
-    logger.info(f"=== BƯỚC 2: Đăng nhập Hotmail (Email: {hotmail_email}) ===")
+    if target_domain:
+        set_preferred_recovery_domain(target_domain)
+    logger.info(f"=== BƯỚC 3: Đăng nhập Hotmail (Email: {hotmail_email}) ===")
 
     try:
         # Mở Tab 2 trực tiếp tới trang đăng nhập Outlook Web App (nlp=1 bỏ qua trang giới thiệu Microsoft 365)
@@ -2844,7 +2978,13 @@ def login_hotmail(
             raise LoginFailedError("Không thể nhập password Hotmail")
 
         # Xử lý các bước bảo mật / Add email / Privacy notice / Stay signed in
-        handle_microsoft_prompts(driver, hotmail_email, recovery_email, current_password=hotmail_password)
+        handle_microsoft_prompts(
+            driver,
+            hotmail_email,
+            recovery_email,
+            current_password=hotmail_password,
+            preferred_domain=target_domain,
+        )
 
         # Xác nhận
         time.sleep(2)
