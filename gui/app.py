@@ -34,7 +34,7 @@ class AutoLoginApp:
         self.root = root
         app_ver = config.get_app_version() if hasattr(config, "get_app_version") else getattr(config, "APP_VERSION", "V 1.0.1")
         self.root.title(f"Auto Login & Register Tool - {app_ver}")
-        self.root.geometry("760x660")
+        self.root.geometry("780x700")
         
         self.stop_flag = threading.Event()
         self.processing_thread = None
@@ -88,20 +88,27 @@ class AutoLoginApp:
         self.entry_sa.grid(row=3, column=1, sticky=tk.EW, pady=2)
         ttk.Button(main_frame, text="Browse", command=self._browse_sa).grid(row=3, column=2, padx=5, pady=2)
         
-        # Separator
-        ttk.Separator(main_frame, orient=tk.HORIZONTAL).grid(row=4, column=0, columnspan=3, sticky=tk.EW, pady=10)
-        ttk.Label(main_frame, text="--- Chọn thao tác ---", font=("", 10, "bold")).grid(row=5, column=0, columnspan=3, pady=5)
-        
-        row_idx = 6
-        
-        # Checkboxes for steps 1 -> 6
+        # Separator & Notebook Tabs (Tab 1: Reg Clone | Tab 2: Reg Gmail)
+        ttk.Separator(main_frame, orient=tk.HORIZONTAL).grid(row=4, column=0, columnspan=3, sticky=tk.EW, pady=(8, 6))
+
+        self.notebook = ttk.Notebook(main_frame)
+        self.notebook.grid(row=5, column=0, columnspan=3, sticky=tk.EW, pady=2)
+
+        tab_clone = ttk.Frame(self.notebook, padding="10")
+        tab_gmail = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(tab_clone, text="   Reg Clone   ")
+        self.notebook.add(tab_gmail, text="   Reg Gmail   ")
+
+        # ==========================================================
+        # TAB 1: REG CLONE (Facebook + Hotmail + Shopee Affiliate)
+        # ==========================================================
         self.cb_vars = {}
-        
+
         # Bước 1: Login Facebook (+ tuỳ chọn Không login bằng Cookie mà dùng ID + Pass)
         self.cb_vars[1] = tk.BooleanVar(value=False)
         self.fb_no_cookie_var = tk.BooleanVar(value=False)
-        fb_row_frame = ttk.Frame(main_frame)
-        fb_row_frame.grid(row=row_idx, column=0, columnspan=3, sticky=tk.W, pady=2)
+        fb_row_frame = ttk.Frame(tab_clone)
+        fb_row_frame.pack(fill=tk.X, anchor=tk.W, pady=2)
         ttk.Checkbutton(
             fb_row_frame, text="1. Login Facebook", variable=self.cb_vars[1]
         ).pack(side=tk.LEFT)
@@ -111,13 +118,12 @@ class AutoLoginApp:
             variable=self.fb_no_cookie_var,
             command=self._on_fb_no_cookie_change,
         ).pack(side=tk.LEFT, padx=(20, 0))
-        row_idx += 1
 
         # Bước 2: Login tài khoản Shopee PH hoặc MY hoặc ID bằng Facebook
         self.cb_vars[2] = tk.BooleanVar(value=False)
         self.shopee_region_var = tk.StringVar(value="Shopee.PH")
-        shopee_row_frame = ttk.Frame(main_frame)
-        shopee_row_frame.grid(row=row_idx, column=0, columnspan=3, sticky=tk.W, pady=2)
+        shopee_row_frame = ttk.Frame(tab_clone)
+        shopee_row_frame.pack(fill=tk.X, anchor=tk.W, pady=2)
         ttk.Checkbutton(
             shopee_row_frame,
             text="2. Login tài khoản Shopee bằng Facebook:",
@@ -141,14 +147,13 @@ class AutoLoginApp:
             variable=self.shopee_region_var,
             value="Shopee ID",
         ).pack(side=tk.LEFT, padx=6)
-        row_idx += 1
-        
+
         # Bước 3: Login Hotmail và đổi password Hotmail (+ tuỳ chọn Thay mail khôi phục về @nguyenmaucole.io.vn hoặc @fviainboxes.com)
         self.cb_vars[3] = tk.BooleanVar(value=False)
         self.hotmail_change_recovery_var = tk.BooleanVar(value=False)
         self.hotmail_recovery_domain_var = tk.StringVar(value="nguyenmaucole.io.vn")
-        hotmail_row_frame = ttk.Frame(main_frame)
-        hotmail_row_frame.grid(row=row_idx, column=0, columnspan=3, sticky=tk.W, pady=2)
+        hotmail_row_frame = ttk.Frame(tab_clone)
+        hotmail_row_frame.pack(fill=tk.X, anchor=tk.W, pady=2)
         ttk.Checkbutton(
             hotmail_row_frame,
             text="3. Login Hotmail và đổi password Hotmail",
@@ -172,13 +177,12 @@ class AutoLoginApp:
             variable=self.hotmail_recovery_domain_var,
             value="fviainboxes.com",
         ).pack(side=tk.LEFT, padx=4)
-        row_idx += 1
 
         # Bước 4: Thêm Email forwarding (chọn @nguyenmaucole.io.vn hoặc @fviainboxes.com)
         self.cb_vars[4] = tk.BooleanVar(value=False)
         self.hotmail_forwarding_domain_var = tk.StringVar(value="nguyenmaucole.io.vn")
-        forwarding_row_frame = ttk.Frame(main_frame)
-        forwarding_row_frame.grid(row=row_idx, column=0, columnspan=3, sticky=tk.W, pady=2)
+        forwarding_row_frame = ttk.Frame(tab_clone)
+        forwarding_row_frame.pack(fill=tk.X, anchor=tk.W, pady=2)
         ttk.Checkbutton(
             forwarding_row_frame,
             text="4. Thêm Email forwarding về:",
@@ -196,44 +200,122 @@ class AutoLoginApp:
             variable=self.hotmail_forwarding_domain_var,
             value="fviainboxes.com",
         ).pack(side=tk.LEFT, padx=6)
-        row_idx += 1
-        
+
         # Bước 5: Reg aff Shopee theo thị trường chọn ở bước 2
         self.cb_vars[5] = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            main_frame,
+            tab_clone,
             text="5. Reg Aff Shopee theo thị trường chọn ở bước 2",
             variable=self.cb_vars[5],
-        ).grid(row=row_idx, column=0, columnspan=3, sticky=tk.W, pady=2)
-        row_idx += 1
+        ).pack(fill=tk.X, anchor=tk.W, pady=2)
 
         # Bước 6: Đổi Pass Shopee
         self.cb_vars[6] = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            main_frame,
+            tab_clone,
             text="6. Đổi Pass Shopee",
             variable=self.cb_vars[6],
-        ).grid(row=row_idx, column=0, columnspan=3, sticky=tk.W, pady=(2, 4))
-        row_idx += 1
-        
-        # Hotmail & Shopee password (cùng 1 hàng)
-        ttk.Label(main_frame, text="New Hotmail Password:").grid(row=row_idx, column=0, sticky=tk.W, pady=5)
-        pass_frame = ttk.Frame(main_frame)
-        pass_frame.grid(row=row_idx, column=1, columnspan=2, sticky=tk.EW, pady=5)
+        ).pack(fill=tk.X, anchor=tk.W, pady=(2, 4))
 
-        self.entry_hotmail_pass = ttk.Entry(pass_frame, width=18)
+        # Hotmail & Shopee password (cùng 1 hàng trong Tab Reg Clone)
+        clone_pass_frame = ttk.Frame(tab_clone)
+        clone_pass_frame.pack(fill=tk.X, anchor=tk.W, pady=(6, 2))
+        ttk.Label(clone_pass_frame, text="New Hotmail Password:").pack(side=tk.LEFT)
+        self.entry_hotmail_pass = ttk.Entry(clone_pass_frame, width=18)
         self.entry_hotmail_pass.insert(0, getattr(config, 'NEW_HOTMAIL_PASSWORD', 'Khoa01@@c'))
-        self.entry_hotmail_pass.pack(side=tk.LEFT)
+        self.entry_hotmail_pass.pack(side=tk.LEFT, padx=(6, 0))
 
-        ttk.Label(pass_frame, text="Pass mới Shopee:").pack(side=tk.LEFT, padx=(15, 5))
-        self.entry_shopee_pass = ttk.Entry(pass_frame, width=18)
+        ttk.Label(clone_pass_frame, text="Pass mới Shopee:").pack(side=tk.LEFT, padx=(18, 5))
+        self.entry_shopee_pass = ttk.Entry(clone_pass_frame, width=18)
         self.entry_shopee_pass.insert(0, getattr(config, 'NEW_SHOPEE_PASSWORD', 'Khoa01@c'))
         self.entry_shopee_pass.pack(side=tk.LEFT)
-        row_idx += 1
-        
+
+        # ==========================================================
+        # TAB 2: REG GMAIL (Gmail Forwarding + Shopee Affiliate)
+        # ==========================================================
+        self.gmail_cb_vars = {}
+
+        # Bước 1: Login Gmail - Thêm Forwarding mail về @nguyenmaucole.io.vn (hoặc @fviainboxes.com)
+        self.gmail_cb_vars[1] = tk.BooleanVar(value=True)
+        self.gmail_forwarding_domain_var = tk.StringVar(value="nguyenmaucole.io.vn")
+        gm_step1_frame = ttk.Frame(tab_gmail)
+        gm_step1_frame.pack(fill=tk.X, anchor=tk.W, pady=3)
+        ttk.Checkbutton(
+            gm_step1_frame,
+            text="1. Login Gmail - Thêm Forwarding mail về:",
+            variable=self.gmail_cb_vars[1],
+        ).pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            gm_step1_frame,
+            text="@nguyenmaucole.io.vn",
+            variable=self.gmail_forwarding_domain_var,
+            value="nguyenmaucole.io.vn",
+        ).pack(side=tk.LEFT, padx=(10, 6))
+        ttk.Radiobutton(
+            gm_step1_frame,
+            text="@fviainboxes.com",
+            variable=self.gmail_forwarding_domain_var,
+            value="fviainboxes.com",
+        ).pack(side=tk.LEFT, padx=6)
+
+        # Bước 2: Login Shopee bằng Gmail với các thị trường PH, MY, ID
+        self.gmail_cb_vars[2] = tk.BooleanVar(value=True)
+        self.gmail_shopee_region_var = tk.StringVar(value="Shopee.PH")
+        gm_step2_frame = ttk.Frame(tab_gmail)
+        gm_step2_frame.pack(fill=tk.X, anchor=tk.W, pady=3)
+        ttk.Checkbutton(
+            gm_step2_frame,
+            text="2. Login Shopee bằng Gmail:",
+            variable=self.gmail_cb_vars[2],
+        ).pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            gm_step2_frame,
+            text="Shopee.PH",
+            variable=self.gmail_shopee_region_var,
+            value="Shopee.PH",
+        ).pack(side=tk.LEFT, padx=(12, 6))
+        ttk.Radiobutton(
+            gm_step2_frame,
+            text="Shopee MY",
+            variable=self.gmail_shopee_region_var,
+            value="Shopee MY",
+        ).pack(side=tk.LEFT, padx=6)
+        ttk.Radiobutton(
+            gm_step2_frame,
+            text="Shopee ID",
+            variable=self.gmail_shopee_region_var,
+            value="Shopee ID",
+        ).pack(side=tk.LEFT, padx=6)
+
+        # Bước 3: Reg AFF Shopee thị trường tương ứng với bước 2 đã chọn
+        self.gmail_cb_vars[3] = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            tab_gmail,
+            text="3. Reg AFF Shopee theo thị trường chọn ở bước 2",
+            variable=self.gmail_cb_vars[3],
+        ).pack(fill=tk.X, anchor=tk.W, pady=3)
+
+        # Bước 4: Change Pass Shopee
+        self.gmail_cb_vars[4] = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            tab_gmail,
+            text="4. Change Pass Shopee (Đổi Pass Shopee)",
+            variable=self.gmail_cb_vars[4],
+        ).pack(fill=tk.X, anchor=tk.W, pady=3)
+
+        # Pass mới Shopee trong Tab Reg Gmail
+        gm_pass_frame = ttk.Frame(tab_gmail)
+        gm_pass_frame.pack(fill=tk.X, anchor=tk.W, pady=(8, 2))
+        ttk.Label(gm_pass_frame, text="Pass mới Shopee:").pack(side=tk.LEFT)
+        self.entry_gmail_shopee_pass = ttk.Entry(gm_pass_frame, width=20)
+        self.entry_gmail_shopee_pass.insert(0, getattr(config, 'NEW_SHOPEE_PASSWORD', 'Khoa01@c'))
+        self.entry_gmail_shopee_pass.pack(side=tk.LEFT, padx=(8, 0))
+
+        row_idx = 6
+
         # Buttons
         btn_frame = ttk.Frame(main_frame)
-        btn_frame.grid(row=row_idx, column=0, columnspan=3, pady=10)
+        btn_frame.grid(row=row_idx, column=0, columnspan=3, pady=8)
         
         self.btn_start = ttk.Button(btn_frame, text="BẮT ĐẦU", command=self.start_processing)
         self.btn_start.pack(side=tk.LEFT, padx=5)
@@ -277,12 +359,18 @@ class AutoLoginApp:
                 (self.entry_sa, "sa_file"),
                 (self.entry_hotmail_pass, "hotmail_pass"),
                 (self.entry_shopee_pass, "shopee_pass"),
+                (self.entry_gmail_shopee_pass, "gmail_shopee_pass"),
             ]:
                 if key in settings:
                     entry.delete(0, tk.END)
                     entry.insert(0, str(settings[key]))
 
-            # Checkboxes (1 -> 6)
+            # Tab đang chọn (0: Reg Clone, 1: Reg Gmail)
+            active_tab = settings.get("active_tab", 0)
+            if active_tab in (0, 1):
+                self.notebook.select(active_tab)
+
+            # Checkboxes Tab Reg Clone (1 -> 6)
             if settings.get("cb_fb"):
                 self.cb_vars[1].set(True)
             if settings.get("cb_fb_no_cookie"):
@@ -306,7 +394,7 @@ class AutoLoginApp:
             if settings.get("cb_shopee_pass"):
                 self.cb_vars[6].set(True)
 
-            # Thị trường Shopee (tương thích cả cấu hình mới 'shopee_market' và cũ 'shopee_region')
+            # Thị trường Shopee Tab Reg Clone
             market = settings.get("shopee_market")
             if market in ("Shopee.PH", "Shopee MY", "Shopee ID"):
                 self.shopee_region_var.set(market)
@@ -320,12 +408,30 @@ class AutoLoginApp:
                     if "cb_shopee_aff" not in settings:
                         self.cb_vars[5].set(True)
 
+            # Checkboxes & Radio Tab Reg Gmail (1 -> 4)
+            for s in (1, 2, 3, 4):
+                k = f"gmail_cb_{s}"
+                if k in settings:
+                    self.gmail_cb_vars[s].set(bool(settings.get(k)))
+            gm_fwd_dom = settings.get("gmail_forwarding_domain")
+            if gm_fwd_dom in ("nguyenmaucole.io.vn", "fviainboxes.com"):
+                self.gmail_forwarding_domain_var.set(gm_fwd_dom)
+            gm_market = settings.get("gmail_shopee_market")
+            if gm_market in ("Shopee.PH", "Shopee MY", "Shopee ID"):
+                self.gmail_shopee_region_var.set(gm_market)
+
         except Exception:
             pass  # File lỗi thì bỏ qua, dùng default
 
     def _save_settings(self):
         """Lưu settings hiện tại ra file JSON."""
+        try:
+            active_tab = self.notebook.index(self.notebook.select())
+        except Exception:
+            active_tab = 0
+
         settings = {
+            "active_tab": active_tab,
             "sheet_url": self.entry_sheet_url.get(),
             "sheet_name": self.entry_sheet_name.get(),
             "start_row": self.entry_start_row.get(),
@@ -334,6 +440,7 @@ class AutoLoginApp:
             "sa_file": self.entry_sa.get(),
             "hotmail_pass": self.entry_hotmail_pass.get(),
             "shopee_pass": self.entry_shopee_pass.get(),
+            "gmail_shopee_pass": self.entry_gmail_shopee_pass.get(),
             "cb_fb": self.cb_vars[1].get(),
             "cb_fb_no_cookie": self.fb_no_cookie_var.get(),
             "cb_shopee_login": self.cb_vars[2].get(),
@@ -345,6 +452,12 @@ class AutoLoginApp:
             "hotmail_forwarding_domain": self.hotmail_forwarding_domain_var.get(),
             "cb_shopee_aff": self.cb_vars[5].get(),
             "cb_shopee_pass": self.cb_vars[6].get(),
+            "gmail_cb_1": self.gmail_cb_vars[1].get(),
+            "gmail_cb_2": self.gmail_cb_vars[2].get(),
+            "gmail_cb_3": self.gmail_cb_vars[3].get(),
+            "gmail_cb_4": self.gmail_cb_vars[4].get(),
+            "gmail_forwarding_domain": self.gmail_forwarding_domain_var.get(),
+            "gmail_shopee_market": self.gmail_shopee_region_var.get(),
         }
         try:
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
@@ -376,11 +489,24 @@ class AutoLoginApp:
         if self.hotmail_change_recovery_var.get() and not self.cb_vars[3].get():
             self.cb_vars[3].set(True)
 
+    def get_active_mode(self) -> str:
+        """Trả về 'gmail' nếu đang ở Tab 'Reg Gmail', ngược lại trả về 'clone'."""
+        try:
+            return "gmail" if self.notebook.index(self.notebook.select()) == 1 else "clone"
+        except Exception:
+            return "clone"
+
     def get_selected_steps(self):
+        mode = self.get_active_mode()
         steps = []
-        for s in (1, 2, 3, 4, 5, 6):
-            if self.cb_vars[s].get():
-                steps.append(s)
+        if mode == "gmail":
+            for s in (1, 2, 3, 4):
+                if self.gmail_cb_vars[s].get():
+                    steps.append(s)
+        else:
+            for s in (1, 2, 3, 4, 5, 6):
+                if self.cb_vars[s].get():
+                    steps.append(s)
         return steps
         
     def get_config(self):
@@ -395,8 +521,24 @@ class AutoLoginApp:
             max_threads = max(1, int(self.entry_threads.get()))
         except ValueError:
             max_threads = getattr(config, 'MAX_THREADS', 4)
-            
+
+        mode = self.get_active_mode()
+        if mode == "gmail":
+            return {
+                'MODE': 'gmail',
+                'GOOGLE_SHEET_URL': self.entry_sheet_url.get(),
+                'SHEET_NAME': self.entry_sheet_name.get(),
+                'START_ROW': start_row,
+                'END_ROW': end_row,
+                'MAX_THREADS': max_threads,
+                'GOOGLE_SERVICE_ACCOUNT_FILE': self.entry_sa.get(),
+                'NEW_SHOPEE_PASSWORD': self.entry_gmail_shopee_pass.get(),
+                'SHOPEE_REGION': self.gmail_shopee_region_var.get(),
+                'GMAIL_FORWARDING_DOMAIN': self.gmail_forwarding_domain_var.get(),
+            }
+
         return {
+            'MODE': 'clone',
             'GOOGLE_SHEET_URL': self.entry_sheet_url.get(),
             'SHEET_NAME': self.entry_sheet_name.get(),
             'START_ROW': start_row,
@@ -440,6 +582,7 @@ class AutoLoginApp:
             return
             
         gui_config = self.get_config()
+        self._save_settings()
         
         self.btn_start.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)

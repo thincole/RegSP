@@ -217,3 +217,81 @@ def validate_parsed_data(data: Dict, steps: list) -> bool:
             return False
 
     return True
+
+
+def parse_gmail_column_b(raw_string: str) -> Dict[str, Optional[str]]:
+    """
+    Phân tích chuỗi Cột B cho Tab 'Reg Gmail'.
+    Định dạng chuẩn: gmail|pass (hỗ trợ thêm |recovery_email hoặc |2fa_secret tùy chọn).
+    """
+    if not raw_string or not raw_string.strip():
+        raise DataParsingError("Chuỗi Cột B (Reg Gmail) rỗng")
+
+    parts = [p.strip() for p in raw_string.split(config.DATA_SEPARATOR)]
+
+    gmail_email = ""
+    gmail_password = ""
+    recovery_email = ""
+    gmail_2fa_secret = ""
+
+    email_idx = -1
+    for i, part in enumerate(parts):
+        if "@" in part and "." in part.split("@")[-1]:
+            gmail_email = part
+            email_idx = i
+            break
+
+    if not gmail_email:
+        raise DataParsingError(
+            f"Không tìm thấy địa chỉ Gmail hợp lệ trong Cột B: {raw_string[:80]}"
+        )
+
+    if email_idx + 1 < len(parts) and "@" not in parts[email_idx + 1]:
+        gmail_password = parts[email_idx + 1]
+
+    for i, part in enumerate(parts):
+        if i in (email_idx, email_idx + 1) or not part:
+            continue
+        if "@" in part and "." in part.split("@")[-1] and part.lower() != gmail_email.lower():
+            if not recovery_email:
+                recovery_email = part
+        else:
+            compact = part.replace(" ", "").upper()
+            if 16 <= len(compact) <= 64 and all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567=" for c in compact):
+                if not gmail_2fa_secret:
+                    gmail_2fa_secret = compact
+
+    masked_pwd = f"***{gmail_password[-3:]}" if len(gmail_password) > 3 else ("***" if gmail_password else "(trống)")
+    logger.info(
+        f"Parsed Gmail: Email={gmail_email}, Pass={masked_pwd}, "
+        f"Recovery={recovery_email or '(không có)'}, 2FA={'CÓ' if gmail_2fa_secret else 'KHÔNG'}"
+    )
+
+    return {
+        "gmail_email": gmail_email,
+        "gmail_password": gmail_password,
+        "recovery_email": recovery_email,
+        "gmail_2fa_secret": gmail_2fa_secret,
+    }
+
+
+def validate_gmail_parsed_data(data: Dict, steps: list) -> bool:
+    """
+    Kiểm tra dữ liệu đã parse có đủ cho các bước đã chọn ở Tab 'Reg Gmail' (1-4):
+      1. Login Gmail - Thêm Forwarding mail
+      2. Login Shopee bằng Gmail (PH / MY / ID)
+      3. Reg AFF Shopee theo thị trường chọn ở bước 2
+      4. Đổi Pass Shopee
+    """
+    gmail_email = (data.get("gmail_email") or "").strip()
+    if not gmail_email or "@" not in gmail_email:
+        logger.error("Thiếu địa chỉ Gmail hợp lệ ở Cột B")
+        return False
+
+    if 1 in steps and not data.get("gmail_password"):
+        logger.warning(
+            f"Cột B ({gmail_email}) không có password -> Sẽ thử sử dụng phiên Gmail đã login sẵn trong profile (nếu có)."
+        )
+
+    return True
+

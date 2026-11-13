@@ -16,10 +16,12 @@ import requests
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
 
 import config
 from utils.logger import get_logger
+from modules.totp_generator import generate_2fa_code, get_remaining_seconds
 from utils.wait_helpers import (
     wait_for_element, wait_for_page_load, wait_for_new_window,
     safe_click, safe_send_keys,
@@ -620,6 +622,364 @@ def _handle_facebook_popup(
     return True
 
 
+def _click_google_login_button(driver: WebDriver, region_name: str = "Shopee.PH") -> bool:
+    """
+    Tìm và click nút đăng nhập bằng Google trên trang Shopee Login.
+    """
+    logger.info("Đang tìm nút 'Google' trên Shopee Login...")
+
+    _wait_for_captcha(driver)
+    if region_name in ("Shopee MY", "Shopee ID"):
+        _select_shopee_english_language(driver, region_name)
+
+    if _is_shopee_captcha_or_blocked(driver) or _check_shopee_logged_in_user(driver):
+        return False
+
+    selectors = [
+        (
+            By.XPATH,
+            "//button[contains(., 'Google') and not(contains(., 'Google Play')) and not(contains(., 'Play Store'))]",
+        ),
+        (By.CSS_SELECTOR, ".social-login-btn--google"),
+        (By.CSS_SELECTOR, ".social-login__btn--google"),
+        (By.CSS_SELECTOR, "[data-net='google']"),
+        (By.CSS_SELECTOR, "[aria-label*='Google']"),
+        (
+            By.XPATH,
+            "//*[@role='button'][contains(., 'Google') and not(contains(., 'Google Play'))]",
+        ),
+        (
+            By.XPATH,
+            "//div[normalize-space()='Google' and not(ancestor::footer)]",
+        ),
+    ]
+
+    for by, value in selectors:
+        if _is_shopee_captcha_or_blocked(driver) or _check_shopee_logged_in_user(driver):
+            return False
+        try:
+            btn = wait_for_element(driver, by, value, timeout=5, condition="clickable")
+            if btn:
+                btn_text = (btn.text or "").strip()
+                if "google play" in btn_text.lower():
+                    continue
+                logger.info(f"Tìm thấy nút Google: '{btn_text or 'Google'}' (selector: {value})")
+                try:
+                    actions = ActionChains(driver)
+                    body_el = driver.find_element(By.TAG_NAME, "body")
+                    actions.move_to_element_with_offset(body_el, random.randint(-120, 120), random.randint(-80, 80))
+                    actions.pause(random.uniform(0.25, 0.45))
+                    actions.move_to_element_with_offset(btn, random.randint(-12, 12), random.randint(-5, 5))
+                    actions.pause(random.uniform(0.3, 0.6))
+                    actions.click()
+                    actions.perform()
+                    time.sleep(3.0)
+                    logger.info("Đã click nút Google (ActionChains)")
+                    return True
+                except Exception:
+                    if safe_click(btn, delay=3.0):
+                        logger.info("Đã click nút Google")
+                        return True
+        except Exception:
+            continue
+
+    logger.error("Không tìm thấy nút 'Google' trên trang Shopee")
+    return False
+
+
+def _complete_shopee_social_signup_if_prompted(driver: WebDriver) -> None:
+    """
+    Sau khi Google OAuth đóng popup, một số tài khoản mới trên Shopee hiện màn hình xác nhận
+    tạo tài khoản (Create Account / Sign Up / Continue - KHÔNG phải xác minh SĐT).
+    """
+    driver.implicitly_wait(0)
+    try:
+        if _is_shopee_phone_verification(driver):
+            return
+        cur_u = (driver.current_url or "").lower()
+        if "signup" not in cur_u and "register" not in cur_u and "social" not in cur_u:
+            return
+        btns = [
+            b for b in driver.find_elements(
+                By.XPATH,
+                "//button[normalize-space()='Create Account' or normalize-space()='Sign Up' or normalize-space()='Continue' or normalize-space()='Confirm'"
+                " or normalize-space()='Buat Akun' or normalize-space()='Lanjutkan' or normalize-space()='Teruskan']",
+            )
+            if b.is_displayed() and b.is_enabled()
+        ]
+        if btns:
+            lbl = (btns[0].text or "").strip()
+            logger.info(f"Bấm xác nhận hoàn tất đăng ký Shopee qua Google ('{lbl}')...")
+            if not safe_click(btns[0], delay=3.0):
+                driver.execute_script("arguments[0].click();", btns[0])
+                time.sleep(3.0)
+    except Exception:
+        pass
+    finally:
+        try:
+            driver.implicitly_wait(5)
+        except Exception:
+            pass
+
+
+def _handle_google_popup(
+    driver: WebDriver,
+    gmail_email: str,
+    gmail_password: str = "",
+    handles_before_click: set = None,
+    shopee_handle: str = None,
+    recovery_email: str = "",
+    twofa_secret: str = "",
+) -> bool:
+    """
+    Xử lý popup Google OAuth khi bấm đăng nhập Shopee bằng Google:
+      1. Chọn tài khoản Gmail đã đăng nhập sẵn (Choose an account) hoặc nhập Email + Password + 2FA.
+      2. Bấm Continue / Tiếp tục / Allow / Cho phép trên màn hình cấp quyền Shopee.
+      3. Chờ popup tự đóng và quay về tab Shopee.
+    """
+    gmail_clean = (gmail_email or "").strip()
+    gmail_low = gmail_clean.lower()
+    logger.info(f"Đang xử lý popup Google OAuth ({gmail_clean})...")
+
+    if not shopee_handle:
+        shopee_handle = driver.current_window_handle
+    if not handles_before_click:
+        handles_before_click = {shopee_handle}
+
+    google_popup_handle = None
+    same_tab_redirect = False
+
+    for attempt_idx in range(15):
+        time.sleep(1)
+        check_browser_alive(driver)
+        current_handles = set(driver.window_handles)
+        new_handles = current_handles - handles_before_click
+        if new_handles:
+            for handle in new_handles:
+                try:
+                    driver.switch_to.window(handle)
+                    cur_url = (driver.current_url or "").lower()
+                    if "google.com" in cur_url or "youtube.com" in cur_url or cur_url.startswith("about:blank"):
+                        google_popup_handle = handle
+                        logger.info(f"Phát hiện popup Google OAuth: {driver.current_url[:80]}")
+                        break
+                except Exception:
+                    continue
+            if google_popup_handle:
+                break
+        else:
+            try:
+                driver.switch_to.window(shopee_handle)
+                cur_main = (driver.current_url or "").lower()
+                if "accounts.google.com" in cur_main:
+                    google_popup_handle = shopee_handle
+                    same_tab_redirect = True
+                    logger.info(f"Phát hiện Google OAuth mở trực tiếp trên tab hiện tại: {driver.current_url[:80]}")
+                    break
+                if "buyer/login" not in cur_main and _check_shopee_logged_in_user(driver):
+                    logger.info("✅ Shopee đã tự động đăng nhập bằng Google không cần popup!")
+                    return True
+            except Exception:
+                pass
+
+            if attempt_idx in (4, 8):
+                try:
+                    driver.switch_to.window(shopee_handle)
+                    g_btns = [
+                        b for b in driver.find_elements(
+                            By.XPATH,
+                            "//button[contains(., 'Google') and not(contains(., 'Google Play'))]",
+                        )
+                        if b.is_displayed()
+                    ]
+                    if g_btns:
+                        logger.info("Popup Google chưa mở, click lại nút <button>Google</button>...")
+                        safe_click(g_btns[0], delay=1.5)
+                except Exception:
+                    pass
+
+    if not google_popup_handle:
+        logger.warning("Không thấy popup Google OAuth mở ra, kiểm tra lại trạng thái tab Shopee...")
+        try:
+            driver.switch_to.window(shopee_handle)
+        except Exception:
+            pass
+        time.sleep(3)
+        return "buyer/login" not in (driver.current_url or "").lower() or bool(_check_shopee_logged_in_user(driver))
+
+    account_selected = False
+    for round_idx in range(12):
+        check_browser_alive(driver)
+        if not same_tab_redirect and google_popup_handle not in driver.window_handles:
+            logger.info("Popup Google OAuth đã tự đóng.")
+            break
+
+        try:
+            driver.switch_to.window(google_popup_handle)
+            cur_u = (driver.current_url or "").lower()
+            if same_tab_redirect and "shopee." in cur_u and "accounts.google.com" not in cur_u:
+                logger.info("Đã hoàn tất Google OAuth và quay lại Shopee.")
+                break
+        except Exception:
+            break
+
+        driver.implicitly_wait(0)
+        try:
+            # 1. Màn hình 'Choose an account' (Chọn tài khoản Google)
+            if not account_selected:
+                tiles = []
+                if gmail_low:
+                    tiles = [
+                        el for el in driver.find_elements(
+                            By.XPATH,
+                            f"//*[@data-identifier='{gmail_low}' or @data-email='{gmail_low}']"
+                            f" | //li[.//*[contains(translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{gmail_low}')]]",
+                        )
+                        if el.is_displayed()
+                    ]
+                if not tiles:
+                    # Nếu chỉ có 1 tài khoản Google duy nhất trong profile thì chọn luôn
+                    all_tiles = [
+                        el for el in driver.find_elements(By.CSS_SELECTOR, "[data-identifier]")
+                        if el.is_displayed() and (el.get_attribute("data-identifier") or "").strip()
+                    ]
+                    if len(all_tiles) == 1:
+                        tiles = all_tiles
+
+                if tiles:
+                    ident = (tiles[0].get_attribute("data-identifier") or gmail_clean).strip()
+                    logger.info(f"Chọn tài khoản Google trong popup: {ident}")
+                    if not safe_click(tiles[0], delay=2.5):
+                        driver.execute_script("arguments[0].click();", tiles[0])
+                        time.sleep(2.5)
+                    account_selected = True
+                    continue
+
+                use_other = [
+                    el for el in driver.find_elements(
+                        By.XPATH,
+                        "//*[contains(normalize-space(), 'Use another account') or contains(normalize-space(), 'Sử dụng một tài khoản khác')]",
+                    )
+                    if el.is_displayed()
+                ]
+                email_vis = [
+                    el for el in driver.find_elements(By.CSS_SELECTOR, "input#identifierId, input[type='email']")
+                    if el.is_displayed()
+                ]
+                if use_other and not email_vis:
+                    if not safe_click(use_other[-1], delay=2.0):
+                        driver.execute_script("arguments[0].click();", use_other[-1])
+                        time.sleep(2.0)
+                    continue
+
+            # 2. Ô nhập Email Google (nếu chưa đăng nhập sẵn)
+            email_inps = [
+                el for el in driver.find_elements(By.CSS_SELECTOR, "input#identifierId, input[type='email']")
+                if el.is_displayed()
+            ]
+            if email_inps and gmail_clean:
+                logger.info(f"Popup Google yêu cầu nhập email: {gmail_clean}")
+                safe_send_keys(email_inps[0], gmail_clean, delay=0.6)
+                next_btns = [
+                    b for b in driver.find_elements(By.CSS_SELECTOR, "#identifierNext button, #identifierNext")
+                    if b.is_displayed()
+                ]
+                if next_btns:
+                    safe_click(next_btns[0], delay=2.5)
+                else:
+                    email_inps[0].send_keys(Keys.RETURN)
+                    time.sleep(2.5)
+                account_selected = True
+                continue
+
+            # 3. Ô nhập Password Google
+            pwd_inps = [
+                el for el in driver.find_elements(By.CSS_SELECTOR, "input[name='Passwd'], input[type='password']")
+                if el.is_displayed()
+            ]
+            if pwd_inps and gmail_password:
+                logger.info("Popup Google yêu cầu nhập mật khẩu...")
+                safe_send_keys(pwd_inps[0], gmail_password, delay=0.6)
+                pwd_next = [
+                    b for b in driver.find_elements(By.CSS_SELECTOR, "#passwordNext button, #passwordNext")
+                    if b.is_displayed()
+                ]
+                if pwd_next:
+                    safe_click(pwd_next[0], delay=3.0)
+                else:
+                    pwd_inps[0].send_keys(Keys.RETURN)
+                    time.sleep(3.0)
+                continue
+
+            # 4. Ô nhập 2FA TOTP (nếu có)
+            totp_inps = [
+                el for el in driver.find_elements(By.CSS_SELECTOR, "input#totpPin, input[name='totpPin']")
+                if el.is_displayed()
+            ]
+            if totp_inps and twofa_secret:
+                rem = get_remaining_seconds(twofa_secret)
+                if rem < 5:
+                    time.sleep(rem + 1)
+                code = generate_2fa_code(twofa_secret)
+                safe_send_keys(totp_inps[0], code, delay=0.6)
+                totp_inps[0].send_keys(Keys.RETURN)
+                time.sleep(2.5)
+                continue
+
+            # 5. Nút cấp quyền OAuth ('Continue' / 'Tiếp tục' / 'Allow' / 'Cho phép' / 'Confirm')
+            consent_btns = [
+                b for b in driver.find_elements(
+                    By.XPATH,
+                    "//button["
+                    "(.//span[normalize-space()='Continue' or normalize-space()='Tiếp tục' or normalize-space()='Allow' or normalize-space()='Cho phép'"
+                    " or normalize-space()='Lanjutkan' or normalize-space()='Teruskan' or normalize-space()='Confirm' or normalize-space()='Xác nhận']"
+                    " or normalize-space()='Continue' or normalize-space()='Tiếp tục' or normalize-space()='Allow' or normalize-space()='Cho phép')"
+                    " and not(contains(., 'Cancel')) and not(contains(., 'Hủy')) and not(contains(., 'Back')) and not(contains(., 'Quay lại'))"
+                    "]"
+                    " | //div[@id='submit_approve_access']//button",
+                )
+                if b.is_displayed() and b.is_enabled()
+            ]
+            if consent_btns:
+                target_b = consent_btns[-1]
+                lbl = (target_b.text or "Continue").strip()
+                logger.info(f"Click nút xác nhận Google OAuth: '{lbl}'")
+                if not safe_click(target_b, delay=2.5):
+                    driver.execute_script("arguments[0].click();", target_b)
+                    time.sleep(2.5)
+                continue
+
+        except Exception as e:
+            logger.debug(f"Google popup round {round_idx} check: {e}")
+        finally:
+            try:
+                driver.implicitly_wait(5)
+            except Exception:
+                pass
+
+        time.sleep(1.5)
+
+    # Chờ popup tự đóng thêm tối đa 6s
+    if not same_tab_redirect:
+        for _ in range(6):
+            if google_popup_handle not in driver.window_handles:
+                break
+            time.sleep(1)
+
+        try:
+            driver.switch_to.window(shopee_handle)
+            logger.info("Đã quay lại tab Shopee sau Google OAuth")
+        except Exception:
+            for h in driver.window_handles:
+                driver.switch_to.window(h)
+                if "shopee" in (driver.current_url or "").lower():
+                    break
+
+    time.sleep(2)
+    _complete_shopee_social_signup_if_prompted(driver)
+    return True
+
+
 def _get_existing_tempmail_ids(tempmail_address: str) -> set:
     """Lấy danh sách ID các email hiện có trên cả nguyenmaucole.io.vn và fviainboxes.com để tránh đọc lại code/link cũ."""
     addr = (tempmail_address or "").strip().lower()
@@ -1188,7 +1548,7 @@ def _switch_to_shopee_tab(driver: WebDriver) -> None:
                     return
             except Exception:
                 continue
-        if any(k in cur_u for k in ("facebook.com", "live.com", "microsoft.com", "office.com")):
+        if any(k in cur_u for k in ("facebook.com", "live.com", "microsoft.com", "office.com", "google.com")):
             try:
                 driver.switch_to.new_window("tab")
             except Exception:
@@ -1391,16 +1751,20 @@ def _register_affiliate(
     fb_uid: str, fb_password: str, region_name: str,
     hotmail_email: str = "",
     forwarding_domain: str = "nguyenmaucole.io.vn",
+    skip_social_link: bool = False,
+    login_method: str = "facebook",
+    gmail_password: str = "",
+    recovery_email: str = "",
+    twofa_secret: str = "",
 ) -> Tuple[str, str]:
     """
     Đăng ký Shopee Affiliate:
     1. Truy cập trang affiliate
-    2. Click "+ Add" Facebook → xử lý popup FB OAuth (Continue as... → Next)
-    3. Điền link FB vào hộp thoại "Add Facebook" → click Confirm
-    4. Điền số điện thoại → click "Verify & Submit"
-    5. Chọn "Verify with Email" → click "Confirm"
-    6. Lấy mã OTP từ <prefix>@<forwarding_domain> → điền mã → click "Next"
-    7. Vào /account_setting lấy Username và Affiliate ID.
+    2. (Nếu skip_social_link=False) Click "+ Add" Facebook → xử lý popup FB OAuth → điền link FB → click Confirm
+    3. Điền số điện thoại → click "Verify & Submit"
+    4. Chọn "Verify with Email" → click "Confirm"
+    5. Lấy mã OTP từ <prefix>@<forwarding_domain> → điền mã → click "Next"
+    6. Vào /account_setting lấy Username và Affiliate ID.
     """
     logger.info(f"=== Đăng ký Affiliate {region_name} ===")
 
@@ -1458,16 +1822,29 @@ def _register_affiliate(
             logger.warning("⚠️ Phát hiện màn hình 'Mobile Phone Verification' trên Shopee -> Bỏ qua luồng này!")
             raise LoginFailedError("Shopee yêu cầu xác minh SĐT (Mobile Phone Verification)")
 
-        # Nếu truy cập Affiliate (hoặc sau khi bấm Enter) bị redirect về buyer/login, thực hiện login FB ngay tại đây
+        # Nếu truy cập Affiliate (hoặc sau khi bấm Enter) bị redirect về buyer/login, thực hiện login ngay tại đây
         if "buyer/login" in (driver.current_url or "").lower():
-            logger.info("Trang Affiliate yêu cầu đăng nhập Shopee -> Thực hiện login bằng Facebook...")
             handles_before_login = set(driver.window_handles)
             login_handle = driver.current_window_handle
-            if _click_facebook_login_button(driver, region_name):
-                _handle_facebook_popup(driver, fb_uid, fb_password, handles_before_login, login_handle)
+            logged_in_here = False
+            if login_method == "google":
+                logger.info("Trang Affiliate yêu cầu đăng nhập Shopee -> Thực hiện login bằng Google...")
+                if _click_google_login_button(driver, region_name):
+                    _handle_google_popup(
+                        driver, hotmail_email, gmail_password, handles_before_login, login_handle,
+                        recovery_email, twofa_secret,
+                    )
+                    logged_in_here = True
+            else:
+                logger.info("Trang Affiliate yêu cầu đăng nhập Shopee -> Thực hiện login bằng Facebook...")
+                if _click_facebook_login_button(driver, region_name):
+                    _handle_facebook_popup(driver, fb_uid, fb_password, handles_before_login, login_handle)
+                    logged_in_here = True
+
+            if logged_in_here:
                 time.sleep(2)
                 if _is_shopee_phone_verification(driver):
-                    logger.warning("⚠️ Phát hiện màn hình 'Mobile Phone Verification' sau khi login FB -> Bỏ qua luồng này!")
+                    logger.warning("⚠️ Phát hiện màn hình 'Mobile Phone Verification' sau khi login -> Bỏ qua luồng này!")
                     raise LoginFailedError("Shopee yêu cầu xác minh SĐT (Mobile Phone Verification)")
                 _wait_for_captcha(driver)
                 time.sleep(2)
@@ -1505,166 +1882,214 @@ def _register_affiliate(
             logger.info("Tài khoản đã hoàn tất đăng ký Affiliate trước đó! Chuyển sang lấy Account Setting...")
             return _get_affiliate_account_setting(driver, affiliate_url)
 
-        # Lưu handles TRƯỚC khi click "+ Add" Facebook vì popup FB OAuth sẽ mở ngay khi click!
-        handles_before = set(driver.window_handles)
-        affiliate_handle = driver.current_window_handle
+        if not skip_social_link:
+            # Lưu handles TRƯỚC khi click "+ Add" Facebook vì popup FB OAuth sẽ mở ngay khi click!
+            handles_before = set(driver.window_handles)
+            affiliate_handle = driver.current_window_handle
 
-        # 2. Click "+ Add" bên cạnh Facebook
-        logger.info("Đang tìm nút '+ Add' Facebook...")
-        fb_add_clicked = False
+            # 2. Click "+ Add" bên cạnh Facebook
+            logger.info("Đang tìm nút '+ Add' Facebook...")
+            fb_add_clicked = False
 
-        fb_add_selectors = [
-            (By.XPATH, "//*[normalize-space()='Facebook']/following::*[normalize-space()='Add'][1]"),
-            (By.XPATH, "//div[contains(., 'Facebook') and not(contains(., 'Instagram'))]//*[contains(text(), 'Add')]"),
-            (By.XPATH, "//*[contains(text(), 'Facebook')]/ancestor::div[1]//*[contains(text(), 'Add')]"),
-            (By.XPATH, "//*[contains(text(), 'Facebook')]/following::*[contains(text(), 'Add')][1]"),
-            (By.XPATH, "//span[contains(text(), 'Facebook')]/ancestor::div[contains(@class, 'platform')]//span[contains(text(), 'Add')]"),
-        ]
+            fb_add_selectors = [
+                (By.XPATH, "//*[normalize-space()='Facebook']/following::*[normalize-space()='Add'][1]"),
+                (By.XPATH, "//div[contains(., 'Facebook') and not(contains(., 'Instagram'))]//*[contains(text(), 'Add')]"),
+                (By.XPATH, "//*[contains(text(), 'Facebook')]/ancestor::div[1]//*[contains(text(), 'Add')]"),
+                (By.XPATH, "//*[contains(text(), 'Facebook')]/following::*[contains(text(), 'Add')][1]"),
+                (By.XPATH, "//span[contains(text(), 'Facebook')]/ancestor::div[contains(@class, 'platform')]//span[contains(text(), 'Add')]"),
+            ]
 
-        for by, value in fb_add_selectors:
-            try:
-                btn = wait_for_element(driver, by, value, timeout=5, condition="clickable")
-                if btn:
-                    logger.info(f"Tìm thấy nút + Add Facebook: '{btn.text}' (selector: {value})")
-                    safe_click(btn, delay=2.0)
-                    fb_add_clicked = True
-                    break
-            except Exception:
-                continue
-
-        if not fb_add_clicked:
-            try:
-                add_buttons = driver.find_elements(By.XPATH, "//*[contains(text(), 'Add')]")
-                for btn in add_buttons:
-                    parent_text = btn.find_element(By.XPATH, "..").text
-                    if "Facebook" in parent_text:
-                        btn.click()
+            for by, value in fb_add_selectors:
+                try:
+                    btn = wait_for_element(driver, by, value, timeout=5, condition="clickable")
+                    if btn:
+                        logger.info(f"Tìm thấy nút + Add Facebook: '{btn.text}' (selector: {value})")
+                        safe_click(btn, delay=2.0)
                         fb_add_clicked = True
-                        logger.info("Clicked + Add Facebook (fallback)")
                         break
-            except Exception:
-                pass
+                except Exception:
+                    continue
 
-        if not fb_add_clicked:
-            logger.error("Không tìm thấy nút + Add Facebook")
-            return "", ""
+            if not fb_add_clicked:
+                try:
+                    add_buttons = driver.find_elements(By.XPATH, "//*[contains(text(), 'Add')]")
+                    for btn in add_buttons:
+                        parent_text = btn.find_element(By.XPATH, "..").text
+                        if "Facebook" in parent_text:
+                            btn.click()
+                            fb_add_clicked = True
+                            logger.info("Clicked + Add Facebook (fallback)")
+                            break
+                except Exception:
+                    pass
 
-        # 3. Xử lý popup FB OAuth MỞ RA NGAY SAU KHI CLICK "+ Add" Facebook
-        fb_popup = None
-        for _ in range(15):
-            time.sleep(1)
-            new_handles = set(driver.window_handles) - handles_before
-            for h in new_handles:
-                driver.switch_to.window(h)
-                if "facebook.com" in driver.current_url:
-                    fb_popup = h
-                    break
-            if fb_popup:
-                break
+            if not fb_add_clicked:
+                logger.error("Không tìm thấy nút + Add Facebook")
+                return "", ""
 
-        if fb_popup:
-            logger.info(f"Phát hiện popup FB OAuth trên trang Affiliate: {driver.current_url[:80]}")
-            driver.switch_to.window(fb_popup)
-            time.sleep(3)
-
-            # Xử lý đầy đủ 4 bước trên popup FB OAuth (hỗ trợ cả Tiếng Việt & Tiếng Anh):
-            # 1. "Tiếp tục dưới tên [Name]" / "Continue as [Name]"
-            # 2. "Tiếp" / "Next" ("Bạn muốn sử dụng Trang nào cùng Shopee?")
-            # 3. "Xong" / "Done" / "Save" / "Lưu" ("Shopee được phép làm gì?")
-            # 4. "OK" ("Bạn hiện đã liên kết Shopee với Facebook")
-            _click_fb_oauth_steps(driver, fb_popup)
-
-            # Chờ popup tự đóng sau khi bấm OK (tối đa 6s), nếu vẫn mở thì đóng
-            for _ in range(6):
-                if fb_popup not in driver.window_handles:
-                    break
+            # 3. Xử lý popup FB OAuth MỞ RA NGAY SAU KHI CLICK "+ Add" Facebook
+            fb_popup = None
+            for _ in range(15):
                 time.sleep(1)
+                new_handles = set(driver.window_handles) - handles_before
+                for h in new_handles:
+                    driver.switch_to.window(h)
+                    if "facebook.com" in driver.current_url:
+                        fb_popup = h
+                        break
+                if fb_popup:
+                    break
 
+            if fb_popup:
+                logger.info(f"Phát hiện popup FB OAuth trên trang Affiliate: {driver.current_url[:80]}")
+                driver.switch_to.window(fb_popup)
+                time.sleep(3)
+
+                _click_fb_oauth_steps(driver, fb_popup)
+
+                # Chờ popup tự đóng sau khi bấm OK (tối đa 6s), nếu vẫn mở thì đóng
+                for _ in range(6):
+                    if fb_popup not in driver.window_handles:
+                        break
+                    time.sleep(1)
+
+                try:
+                    if fb_popup in driver.window_handles and len(driver.window_handles) > 1:
+                        driver.switch_to.window(fb_popup)
+                        driver.close()
+                except Exception:
+                    pass
+
+                try:
+                    driver.switch_to.window(affiliate_handle)
+                    logger.info("Đã quay lại trang Affiliate")
+                except Exception:
+                    for h in driver.window_handles:
+                        driver.switch_to.window(h)
+                        if "affiliate" in driver.current_url.lower():
+                            break
+            else:
+                logger.info("Không có popup FB OAuth mới (có thể đã tự xác nhận)")
+
+            time.sleep(2)
+
+            # 4. Dialog "Add Facebook" trên trang Affiliate → điền link FB → click Confirm
+            logger.info(f"Điền link FB profile vào hộp thoại Add Facebook: {fb_profile_url}")
+
+            url_input_selectors = [
+                (By.CSS_SELECTOR, ".ant-modal textarea.ant-input"),
+                (By.CSS_SELECTOR, "textarea[placeholder*='profile URL']"),
+                (By.XPATH, "//textarea[contains(@placeholder, 'profile')]"),
+                (By.XPATH, "//input[contains(@placeholder, 'profile URL')]"),
+                (By.XPATH, "//input[contains(@placeholder, 'paste')]"),
+                (By.CSS_SELECTOR, ".ant-modal input.ant-input"),
+            ]
+
+            url_filled = False
+            for by, value in url_input_selectors:
+                try:
+                    inp = wait_for_element(driver, by, value, timeout=3, condition="visible")
+                    if inp:
+                        inp.clear()
+                        safe_send_keys(inp, fb_profile_url, delay=0.5)
+                        logger.info("✅ Đã điền link FB profile")
+                        url_filled = True
+                        break
+                except Exception:
+                    continue
+
+            if not url_filled:
+                logger.error("Không tìm thấy ô nhập URL Facebook trong hộp thoại Add Facebook")
+                return "", ""
+
+            time.sleep(1)
+
+            # Click "Confirm" trong modal Add Facebook
+            confirm_selectors = [
+                (By.CSS_SELECTOR, ".ant-modal button.ant-btn-primary"),
+                (By.XPATH, "//div[contains(@class, 'ant-modal')]//button[contains(., 'Confirm')]"),
+                (By.XPATH, "//button[contains(., 'Confirm')]"),
+                (By.XPATH, "//span[contains(text(), 'Confirm')]"),
+            ]
+            for by, value in confirm_selectors:
+                try:
+                    btn = wait_for_element(driver, by, value, timeout=5, condition="clickable")
+                    if btn:
+                        safe_click(btn, delay=2.0)
+                        logger.info("✅ Đã click Confirm hộp thoại Add Facebook")
+                        break
+                except Exception:
+                    continue
+
+            time.sleep(2)
+        else:
+            logger.info("ℹ️ Chế độ Reg Gmail: Bỏ qua mục liên kết mạng xã hội (Media Information)...")
+            # Nếu trang đăng ký chia nhiều bước (chưa hiện ô SĐT mà có nút Next / Skip) thì bấm chuyển sang bước Contact Info
+            driver.implicitly_wait(0)
             try:
-                if fb_popup in driver.window_handles and len(driver.window_handles) > 1:
-                    driver.switch_to.window(fb_popup)
-                    driver.close()
+                for _ in range(2):
+                    phone_vis = [
+                        e for e in driver.find_elements(By.CSS_SELECTOR, "input[placeholder*='phone']")
+                        if e.is_displayed()
+                    ]
+                    if phone_vis:
+                        break
+                    step_next_btns = [
+                        b for b in driver.find_elements(
+                            By.XPATH,
+                            "//button[normalize-space()='Skip' or normalize-space()='Next' or .//span[normalize-space()='Skip' or normalize-space()='Next']]",
+                        )
+                        if b.is_displayed() and b.is_enabled()
+                    ]
+                    if step_next_btns:
+                        lbl = (step_next_btns[0].text or "").strip()
+                        logger.info(f"Bấm '{lbl}' chuyển sang phần Contact Information...")
+                        if not safe_click(step_next_btns[0], delay=2.0):
+                            driver.execute_script("arguments[0].click();", step_next_btns[0])
+                            time.sleep(2.0)
+                    else:
+                        break
             except Exception:
                 pass
+            finally:
+                driver.implicitly_wait(5)
 
-            try:
-                driver.switch_to.window(affiliate_handle)
-                logger.info("Đã quay lại trang Affiliate")
-            except Exception:
-                for h in driver.window_handles:
-                    driver.switch_to.window(h)
-                    if "affiliate" in driver.current_url.lower():
-                        break
+        # 5. Điền số điện thoại theo đầu số di động của thị trường tương ứng (+63 PH / +60 MY / +62 ID)
+        detected_dial = ""
+        try:
+            form_txt = driver.execute_script("return document.body ? document.body.innerText : '';") or ""
+            for dial_code in ("+60", "+62", "+63"):
+                if dial_code in form_txt:
+                    detected_dial = dial_code
+                    break
+        except Exception:
+            pass
+
+        if detected_dial == "+60" or (not detected_dial and region_name == "Shopee MY"):
+            my_prefixes = ["12", "13", "14", "16", "17", "18", "19"]
+            chosen_prefix = random.choice(my_prefixes)
+            phone_number = chosen_prefix + "".join([str(random.randint(0, 9)) for _ in range(7)])
+            logger.info(f"Điền số điện thoại Malaysia (+60 {chosen_prefix}xxxxxxx): {phone_number}")
+        elif detected_dial == "+62" or (not detected_dial and region_name == "Shopee ID"):
+            id_prefixes = ["812", "813", "821", "822", "852", "853", "857", "877", "878"]
+            chosen_prefix = random.choice(id_prefixes)
+            phone_number = chosen_prefix + "".join([str(random.randint(0, 9)) for _ in range(8)])
+            logger.info(f"Điền số điện thoại Indonesia (+62 {chosen_prefix}xxxxxxxx): {phone_number}")
         else:
-            logger.info("Không có popup FB OAuth mới (có thể đã tự xác nhận)")
-
-        time.sleep(2)
-
-        # 4. Dialog "Add Facebook" trên trang Affiliate → điền link FB → click Confirm
-        logger.info(f"Điền link FB profile vào hộp thoại Add Facebook: {fb_profile_url}")
-
-        url_input_selectors = [
-            (By.CSS_SELECTOR, ".ant-modal textarea.ant-input"),
-            (By.CSS_SELECTOR, "textarea[placeholder*='profile URL']"),
-            (By.XPATH, "//textarea[contains(@placeholder, 'profile')]"),
-            (By.XPATH, "//input[contains(@placeholder, 'profile URL')]"),
-            (By.XPATH, "//input[contains(@placeholder, 'paste')]"),
-            (By.CSS_SELECTOR, ".ant-modal input.ant-input"),
-        ]
-
-        url_filled = False
-        for by, value in url_input_selectors:
-            try:
-                inp = wait_for_element(driver, by, value, timeout=3, condition="visible")
-                if inp:
-                    inp.clear()
-                    safe_send_keys(inp, fb_profile_url, delay=0.5)
-                    logger.info("✅ Đã điền link FB profile")
-                    url_filled = True
-                    break
-            except Exception:
-                continue
-
-        if not url_filled:
-            logger.error("Không tìm thấy ô nhập URL Facebook trong hộp thoại Add Facebook")
-            return "", ""
-
-        time.sleep(1)
-
-        # Click "Confirm" trong modal Add Facebook
-        confirm_selectors = [
-            (By.CSS_SELECTOR, ".ant-modal button.ant-btn-primary"),
-            (By.XPATH, "//div[contains(@class, 'ant-modal')]//button[contains(., 'Confirm')]"),
-            (By.XPATH, "//button[contains(., 'Confirm')]"),
-            (By.XPATH, "//span[contains(text(), 'Confirm')]"),
-        ]
-        for by, value in confirm_selectors:
-            try:
-                btn = wait_for_element(driver, by, value, timeout=5, condition="clickable")
-                if btn:
-                    safe_click(btn, delay=2.0)
-                    logger.info("✅ Đã click Confirm hộp thoại Add Facebook")
-                    break
-            except Exception:
-                continue
-
-        time.sleep(2)
-
-        # 5. Điền số điện thoại theo đầu số di động Philippines (bỏ số 0 ở đầu vì sau +63: 3 số đầu mạng + 7 số ngẫu nhiên = 10 chữ số)
-        ph_prefixes = [
-            # Globe / TM
-            "905", "906", "915", "916", "917", "926", "927", "935", "936",
-            "945", "955", "956", "965", "966", "967", "975", "977", "995", "997",
-            # Smart / TNT / Sun
-            "907", "908", "909", "910", "912", "918", "919", "920", "921", "922",
-            "923", "928", "929", "930", "938", "939", "946", "947", "948", "949",
-            "950", "951", "961", "968", "969", "970", "998", "999",
-            # DITO
-            "895", "896", "897", "898", "991", "992", "993", "994",
-        ]
-        chosen_prefix = random.choice(ph_prefixes)
-        phone_number = chosen_prefix + "".join([str(random.randint(0, 9)) for _ in range(7)])
-        logger.info(f"Điền số điện thoại (+63 {chosen_prefix}xxxxxxx): {phone_number}")
+            ph_prefixes = [
+                # Globe / TM
+                "905", "906", "915", "916", "917", "926", "927", "935", "936",
+                "945", "955", "956", "965", "966", "967", "975", "977", "995", "997",
+                # Smart / TNT / Sun
+                "907", "908", "909", "910", "912", "918", "919", "920", "921", "922",
+                "923", "928", "929", "930", "938", "939", "946", "947", "948", "949",
+                "950", "951", "961", "968", "969", "970", "998", "999",
+                # DITO
+                "895", "896", "897", "898", "991", "992", "993", "994",
+            ]
+            chosen_prefix = random.choice(ph_prefixes)
+            phone_number = chosen_prefix + "".join([str(random.randint(0, 9)) for _ in range(7)])
+            logger.info(f"Điền số điện thoại (+63 {chosen_prefix}xxxxxxx): {phone_number}")
 
         phone_selectors = [
             (By.CSS_SELECTOR, "input[placeholder*='phone number']"),
@@ -2147,6 +2572,225 @@ def login_shopee_account_via_facebook(
         raise LoginFailedError(f"Lỗi login {region_name}: {e}")
 
 
+def login_shopee_account_via_google(
+    driver: WebDriver,
+    gmail_email: str,
+    gmail_password: str,
+    shopee_url: str,
+    region_name: str = "Shopee.PH",
+    recovery_email: str = "",
+    twofa_secret: str = "",
+) -> bool:
+    """
+    Bước 2 (Tab Reg Gmail): Đăng nhập tài khoản Shopee (PH / MY / ID) bằng Google (Gmail).
+
+    Returns:
+        True nếu đăng nhập tài khoản Shopee thành công.
+    """
+    logger.info(f"=== BƯỚC 2: Login tài khoản {region_name} bằng Gmail (URL: {shopee_url}) ===")
+
+    try:
+        _enable_shopee_antibot_bypass(driver)
+
+        affiliate_url = config.SHOPEE_AFFILIATE_URLS.get(region_name, "")
+        target_login_url = shopee_url
+        if affiliate_url and "next=" not in shopee_url:
+            sep = "&" if "?" in shopee_url else "?"
+            target_login_url = f"{shopee_url}{sep}next={urllib.parse.quote(affiliate_url, safe='')}"
+
+        logger.info(f"Mở tab mới và chuyển tới {target_login_url}...")
+        try:
+            driver.switch_to.new_window("tab")
+        except Exception:
+            driver.execute_script("window.open('about:blank', '_blank');")
+            time.sleep(0.5)
+            driver.switch_to.window(driver.window_handles[-1])
+        _enable_shopee_antibot_bypass(driver)
+        try:
+            driver.get(target_login_url)
+        except TimeoutException:
+            logger.warning(f"Trang {target_login_url} tải chậm quá timeout -> dừng nạp phụ và tiếp tục...")
+            try:
+                driver.execute_script("window.stop();")
+            except Exception:
+                pass
+
+        already_logged_in = False
+        need_affiliate_fallback = False
+        need_lang_select = region_name in ("Shopee MY", "Shopee ID")
+        for poll_idx in range(12):  # Tối đa 6s (12 * 0.5s)
+            time.sleep(0.5)
+            check_browser_alive(driver)
+            if need_lang_select:
+                _select_shopee_english_language(driver, region_name)
+            if _is_shopee_phone_verification(driver):
+                logger.warning("⚠️ Phát hiện màn hình 'Mobile Phone Verification' trên Shopee -> Bỏ qua luồng này!")
+                raise LoginFailedError("Shopee yêu cầu xác minh SĐT (Mobile Phone Verification)")
+            existing_user = _check_shopee_logged_in_user(driver)
+            if existing_user:
+                logger.info(f"✅ Phát hiện nhanh đã đăng nhập sẵn {region_name} (user: '{existing_user}')!")
+                already_logged_in = True
+                break
+            if _is_shopee_captcha_or_blocked(driver):
+                logger.info(
+                    f"⚠️ Phát hiện trang Captcha / 'Please Try Again Later' ({driver.current_url[:60]}) "
+                    f"-> Thử đăng nhập Google qua trang Affiliate..."
+                )
+                need_affiliate_fallback = True
+                break
+            if not need_lang_select or poll_idx >= 4:
+                driver.implicitly_wait(0)
+                try:
+                    g_btns = driver.find_elements(
+                        By.XPATH, "//button[contains(., 'Google') and not(contains(., 'Google Play'))]"
+                    )
+                    if g_btns and any(b.is_displayed() for b in g_btns):
+                        if need_lang_select:
+                            _select_shopee_english_language(driver, region_name)
+                        break
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        driver.implicitly_wait(5)
+                    except Exception:
+                        pass
+
+        if already_logged_in:
+            return True
+
+        if not need_affiliate_fallback:
+            handles_before_click = set(driver.window_handles)
+            shopee_handle = driver.current_window_handle
+
+            if not _click_google_login_button(driver, region_name):
+                if _is_shopee_phone_verification(driver):
+                    logger.warning("⚠️ Phát hiện màn hình 'Mobile Phone Verification' trên Shopee -> Bỏ qua luồng này!")
+                    raise LoginFailedError("Shopee yêu cầu xác minh SĐT (Mobile Phone Verification)")
+                existing_user = _check_shopee_logged_in_user(driver)
+                if existing_user:
+                    logger.info(f"✅ Đã đăng nhập sẵn {region_name} (username: '{existing_user}')!")
+                    return True
+                elif _is_shopee_captcha_or_blocked(driver):
+                    logger.info(
+                        f"⚠️ Phát hiện trang Captcha / 'Please Try Again Later' ({driver.current_url[:60]}) "
+                        f"-> Thử đăng nhập Google qua trang Affiliate..."
+                    )
+                    need_affiliate_fallback = True
+                else:
+                    raise LoginFailedError(f"Không tìm thấy nút Google trên {region_name}")
+            else:
+                if _is_shopee_phone_verification(driver):
+                    logger.warning("⚠️ Phát hiện màn hình 'Mobile Phone Verification' trên Shopee -> Bỏ qua luồng này!")
+                    raise LoginFailedError("Shopee yêu cầu xác minh SĐT (Mobile Phone Verification)")
+                if not (set(driver.window_handles) - handles_before_click):
+                    _wait_for_captcha(driver)
+                    if (
+                        not (set(driver.window_handles) - handles_before_click)
+                        and "buyer/login" in (driver.current_url or "").lower()
+                    ):
+                        _click_google_login_button(driver, region_name)
+                if _is_shopee_captcha_or_blocked(driver):
+                    logger.info(
+                        "⚠️ Phát hiện 'Please Try Again Later' sau khi bấm Google -> Thử đăng nhập qua trang Affiliate..."
+                    )
+                    need_affiliate_fallback = True
+                else:
+                    if not _handle_google_popup(
+                        driver, gmail_email, gmail_password, handles_before_click, shopee_handle,
+                        recovery_email, twofa_secret,
+                    ):
+                        raise LoginFailedError(f"Xử lý popup Google thất bại ({region_name})")
+
+        if need_affiliate_fallback and affiliate_url:
+            logger.info(f"Truy cập trang Affiliate để thực hiện login Google: {affiliate_url}")
+            try:
+                driver.get(affiliate_url)
+            except TimeoutException:
+                try:
+                    driver.execute_script("window.stop();")
+                except Exception:
+                    pass
+            time.sleep(4)
+            wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
+            time.sleep(2)
+            if need_lang_select:
+                _select_shopee_english_language(driver, region_name)
+
+            driver.implicitly_wait(0)
+            try:
+                enter_els = [
+                    e for e in driver.find_elements(
+                        By.XPATH,
+                        "//a[contains(@class,'home-btn') or normalize-space()='Enter' or normalize-space()='ENTER']"
+                        " | //button[normalize-space()='Enter' or normalize-space()='ENTER']",
+                    )
+                    if e.is_displayed()
+                ]
+                if enter_els:
+                    if not safe_click(enter_els[0], delay=3.0):
+                        driver.execute_script("arguments[0].click();", enter_els[0])
+                        time.sleep(3.0)
+                    wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
+                    time.sleep(2)
+            except Exception:
+                pass
+            finally:
+                driver.implicitly_wait(5)
+
+            if _is_shopee_phone_verification(driver):
+                logger.warning("⚠️ Phát hiện màn hình 'Mobile Phone Verification' trên Shopee -> Bỏ qua luồng này!")
+                raise LoginFailedError("Shopee yêu cầu xác minh SĐT (Mobile Phone Verification)")
+
+            if "buyer/login" in (driver.current_url or "").lower():
+                handles_before_login = set(driver.window_handles)
+                login_handle = driver.current_window_handle
+                if _click_google_login_button(driver, region_name):
+                    _handle_google_popup(
+                        driver, gmail_email, gmail_password, handles_before_login, login_handle,
+                        recovery_email, twofa_secret,
+                    )
+
+        time.sleep(2)
+        _complete_shopee_social_signup_if_prompted(driver)
+        if _is_shopee_phone_verification(driver):
+            logger.warning("⚠️ Phát hiện màn hình 'Mobile Phone Verification' sau khi login Gmail -> Bỏ qua luồng này!")
+            raise LoginFailedError("Shopee yêu cầu xác minh SĐT (Mobile Phone Verification)")
+        _wait_for_captcha(driver)
+
+        for _ in range(10):
+            check_browser_alive(driver)
+            _complete_shopee_social_signup_if_prompted(driver)
+            if _is_shopee_phone_verification(driver):
+                logger.warning("⚠️ Phát hiện màn hình 'Mobile Phone Verification' trên Shopee -> Bỏ qua luồng này!")
+                raise LoginFailedError("Shopee yêu cầu xác minh SĐT (Mobile Phone Verification)")
+            cur_u = (driver.current_url or "").lower()
+            if "buyer/login" not in cur_u or _check_shopee_logged_in_user(driver):
+                break
+            _wait_for_captcha(driver)
+            time.sleep(1)
+
+        if _is_shopee_phone_verification(driver):
+            logger.warning("⚠️ Phát hiện màn hình 'Mobile Phone Verification' trên Shopee -> Bỏ qua luồng này!")
+            raise LoginFailedError("Shopee yêu cầu xác minh SĐT (Mobile Phone Verification)")
+
+        current_url = driver.current_url or ""
+        if "buyer/login" not in current_url.lower() or _check_shopee_logged_in_user(driver):
+            logger.info(f"✅ Bước 2: Đăng nhập tài khoản {region_name} bằng Gmail thành công! URL: {current_url}")
+            return True
+
+        logger.error(f"❌ Bước 2: Vẫn ở trang login {region_name}. URL: {current_url}")
+        return False
+
+    except (BrowserClosedError, LoginFailedError):
+        raise
+    except Exception as e:
+        if is_browser_closed_exception(e):
+            raise BrowserClosedError(f"Trình duyệt đã bị đóng: {e}") from e
+        logger.error(f"Lỗi login Gmail trên {region_name}: {e}")
+        raise LoginFailedError(f"Lỗi login Gmail trên {region_name}: {e}")
+
+
 def register_shopee_affiliate(
     driver: WebDriver,
     fb_uid: str,
@@ -2154,20 +2798,26 @@ def register_shopee_affiliate(
     region_name: str = "Shopee.PH",
     hotmail_email: str = "",
     forwarding_domain: str = "nguyenmaucole.io.vn",
+    skip_social_link: bool = False,
+    login_method: str = "facebook",
+    gmail_password: str = "",
+    recovery_email: str = "",
+    twofa_secret: str = "",
 ) -> Tuple[bool, str, str]:
     """
-    Bước 5: Đăng ký Shopee Affiliate theo thị trường đã chọn ở Bước 2.
+    Đăng ký Shopee Affiliate theo thị trường đã chọn ở Bước 2 (hỗ trợ cả Tab Reg Clone & Tab Reg Gmail).
 
     Returns:
         Tuple (success, username, affiliate_id)
     """
-    logger.info(f"=== BƯỚC 5: Reg Aff Shopee ({region_name}) ===")
+    logger.info(f"=== Reg Aff Shopee ({region_name}) ===")
     try:
         _switch_to_shopee_tab(driver)
         _enable_shopee_antibot_bypass(driver)
 
-        fb_profile_url = f"https://www.facebook.com/profile.php?id={fb_uid}"
-        logger.info(f"FB Profile URL: {fb_profile_url}")
+        fb_profile_url = f"https://www.facebook.com/profile.php?id={fb_uid}" if fb_uid and not skip_social_link else ""
+        if fb_profile_url:
+            logger.info(f"FB Profile URL: {fb_profile_url}")
 
         affiliate_url = config.SHOPEE_AFFILIATE_URLS.get(region_name, "")
         if not affiliate_url:
@@ -2183,6 +2833,11 @@ def register_shopee_affiliate(
             region_name,
             hotmail_email,
             forwarding_domain,
+            skip_social_link=skip_social_link,
+            login_method=login_method,
+            gmail_password=gmail_password,
+            recovery_email=recovery_email,
+            twofa_secret=twofa_secret,
         )
         if username or affiliate_id:
             return True, username, affiliate_id
