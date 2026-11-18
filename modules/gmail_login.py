@@ -5,8 +5,9 @@ import html
 import json
 import re
 import time
+import unicodedata
 import urllib.request
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from selenium.common.exceptions import TimeoutException
@@ -23,6 +24,7 @@ from utils.error_handler import (
     is_browser_closed_exception,
 )
 from utils.logger import get_logger
+from modules.hupsms_api import HupSmsClient, HupSmsError
 from modules.totp_generator import generate_2fa_code, get_remaining_seconds
 from utils.wait_helpers import safe_click, safe_send_keys, wait_for_element, wait_for_page_load
 
@@ -111,15 +113,542 @@ def _dismiss_gmail_popups(driver: WebDriver) -> None:
             pass
 
 
+def _normalize_prompt_text(text: str) -> str:
+    """Chuẩn hóa dấu nháy cong Unicode và chữ thường để so khớp thông báo Google chính xác."""
+    return (
+        (text or "")
+        .replace("\u2019", "'")
+        .replace("\u2018", "'")
+        .replace("\u02bc", "'")
+        .lower()
+    )
+
+
+_GOOGLE_PHONE_REJECT_KEYWORDS = (
+    "this phone number cannot be used",
+    "phone number cannot be used",
+    "cannot be used for verification",
+    "used too many times",
+    "too many failed attempts",
+    "too many attempts",
+    "try a different phone number",
+    "try a different number",
+    "there was a problem verifying",
+    "not a valid phone number",
+    "enter a valid phone number",
+    "format isn't right",
+    "so dien thoai nay khong the dung",
+    "khong the su dung so dien thoai",
+    "duoc su dung qua nhieu lan",
+    "thu mot so khac",
+    "so dien thoai khong hop le",
+    "khong dung dinh dang",
+)
+
+_GOOGLE_OTP_REJECT_KEYWORDS = (
+    "wrong code",
+    "invalid code",
+    "try again with another code",
+    "code is incorrect",
+    "code has expired",
+    "ma khong dung",
+    "khong chinh xac",
+    "ma da het han",
+)
+
+
+def _has_visible_google_captcha(driver: WebDriver, body_norm_low: str) -> bool:
+    """Kiểm tra xem trang Google hiện tại có đang bắt giải Captcha hiển thị hay không."""
+    if any(
+        k in body_norm_low
+        for k in ("captcha", "type the text you hear or see", "nhập văn bản bạn nghe hoặc thấy", "nhap van ban ban nghe hoac thay")
+    ):
+        return True
+    try:
+        for img in driver.find_elements(By.CSS_SELECTOR, "img#captchaimg, img[src*='Captcha' i]"):
+            if img.is_displayed():
+                return True
+        for frame in driver.find_elements(By.CSS_SELECTOR, "iframe[src*='recaptcha']"):
+            if frame.is_displayed():
+                size = frame.size or {}
+                if size.get("height", 0) > 60 and size.get("width", 0) > 60:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _detect_google_manual_verification(cur_url_low: str, body_norm_low: str) -> Optional[str]:
+    """
+    Nhận diện màn hình Google yêu cầu xác minh thủ công (SĐT / danh tính / Captcha).
+    Trả về mô tả lý do nếu đang bị chặn, hoặc None nếu không phải.
+    """
+    if "captcha" in body_norm_low:
+        return "Google yêu cầu giải Captcha"
+    if (
+        "/signin/challenge/iap" in cur_url_low
+        or "enter a phone number" in body_norm_low
+        or "nhập số điện thoại" in body_norm_low
+        or "nhap so dien thoai" in body_norm_low
+    ):
+        return "Google yêu cầu xác minh SĐT (Verify it's you)"
+    if (
+        "verify it's you" in body_norm_low
+        or "xac minh danh tinh" in body_norm_low
+        or "xác minh danh tính" in body_norm_low
+        or "/signin/challenge/dp" in cur_url_low
+        or "/signin/challenge/ipp" in cur_url_low
+        or "/signin/challenge/sq" in cur_url_low
+        or "/signin/challenge/selection" in cur_url_low
+    ):
+        return "Google yêu cầu xác minh danh tính (Verify it's you)"
+    return None
+
+
+def _is_skippable_google_phone_nudge(driver: WebDriver, cur_url_low: str) -> bool:
+    """Tránh thuê SIM ở màn hình gds/myaccount chỉ gợi ý thêm SĐT khôi phục có nút Bỏ qua."""
+    if "gds.google.com" in cur_url_low:
+        return True
+    try:
+        skip_els = driver.find_elements(
+            By.XPATH,
+            "//button[normalize-space()='Not now' or normalize-space()='Để sau' or normalize-space()='Skip' or normalize-space()='Bỏ qua' or normalize-space()='Cancel' or normalize-space()='Hủy' or .//span[normalize-space()='Not now' or normalize-space()='Để sau' or normalize-space()='Skip' or normalize-space()='Bỏ qua']]"
+            " | //a[normalize-space()='Not now' or normalize-space()='Để sau' or normalize-space()='Skip' or normalize-space()='Bỏ qua']",
+        )
+        return any(el.is_displayed() for el in skip_els)
+    except Exception:
+        return False
+
+
+def _find_visible_phone_input(driver: WebDriver):
+    """Tìm ô nhập số điện thoại Google (tránh nhầm với ô nhập OTP/2FA)."""
+    for el in driver.find_elements(
+        By.CSS_SELECTOR,
+        "input#phoneNumberId, input[name='phoneNumber'], input[type='tel'], input[aria-label*='Phone' i], input[aria-label*='điện thoại' i]",
+    ):
+        try:
+            if not el.is_displayed():
+                continue
+            eid = (el.get_attribute("id") or "").lower()
+            ename = (el.get_attribute("name") or "").lower()
+            ac = (el.get_attribute("autocomplete") or "").lower()
+            if eid in ("idvanyphonepin", "totppin") or ename in ("idvanyphonepin", "pin", "totppin", "code") or ac == "one-time-code":
+                continue
+            return el
+        except Exception:
+            continue
+    return None
+
+
+def _find_visible_phone_otp_input(driver: WebDriver, cur_url_low: str = "", body_norm_low: str = ""):
+    """Tìm ô nhập mã SMS OTP trên Google."""
+    for el in driver.find_elements(
+        By.CSS_SELECTOR,
+        "input#idvAnyPhonePin, input[name='idvAnyPhonePin'], input[name='Pin'], input[name='code'], input[autocomplete='one-time-code']",
+    ):
+        try:
+            if not el.is_displayed():
+                continue
+            eid = (el.get_attribute("id") or "").lower()
+            ename = (el.get_attribute("name") or "").lower()
+            if eid == "totppin" or ename == "totppin":
+                continue
+            return el
+        except Exception:
+            continue
+
+    if any(k in cur_url_low for k in ("idvanyphoneverify", "challenge/iap")) and any(
+        k in body_norm_low
+        for k in ("enter the code", "enter code", "nhập mã", "nhap ma", "sent a text", "vừa gửi", "vua gui", "6-digit", "6 chữ số")
+    ):
+        for el in driver.find_elements(By.CSS_SELECTOR, "input[type='tel'], input[type='text']"):
+            try:
+                if not el.is_displayed():
+                    continue
+                eid = (el.get_attribute("id") or "").lower()
+                ename = (el.get_attribute("name") or "").lower()
+                if eid == "phonenumberid" or ename == "phonenumber":
+                    continue
+                return el
+            except Exception:
+                continue
+    return None
+
+
+def _select_sms_delivery_option_if_present(driver: WebDriver) -> None:
+    """Chọn 'Text message' / 'Tin nhắn văn bản' nếu màn hình có radio Text vs Call."""
+    try:
+        radios = driver.find_elements(
+            By.XPATH,
+            "//input[@type='radio'] | //*[@role='radio'] | //label[.//input[@type='radio']]",
+        )
+        for rad in radios:
+            if not rad.is_displayed():
+                continue
+            txt = _normalize_prompt_text(
+                (rad.text or "") + " " + (rad.get_attribute("aria-label") or "") + " " + (rad.get_attribute("value") or "")
+            )
+            if any(k in txt for k in ("text", "sms", "tin nhan", "tin nhắn")) and not any(
+                k in txt for k in ("call", "voice", "cuoc goi", "cuộc gọi")
+            ):
+                checked = (rad.get_attribute("aria-checked") or "").lower() == "true"
+                if not checked:
+                    try:
+                        if rad.tag_name.lower() == "input" and rad.is_selected():
+                            return
+                    except Exception:
+                        pass
+                    if not safe_click(rad, delay=0.5):
+                        driver.execute_script("arguments[0].click();", rad)
+                        time.sleep(0.5)
+                return
+    except Exception:
+        pass
+
+
+def _select_vn_country_and_enter_phone(driver: WebDriver, phone_inp, phone_e164: str, phone_local: str) -> None:
+    """Chọn mã vùng Việt Nam (+84) nếu có dropdown, rồi điền số điện thoại sạch."""
+    value_to_type = phone_e164
+
+    # 1. Nếu là <select> chuẩn
+    try:
+        for sel_el in driver.find_elements(By.CSS_SELECTOR, "select"):
+            if not sel_el.is_displayed():
+                continue
+            opts = sel_el.find_elements(By.TAG_NAME, "option")
+            for opt in opts:
+                ov = (opt.get_attribute("value") or "").strip().upper()
+                ot = _normalize_prompt_text(opt.text or "")
+                if ov == "VN" or "+84" in ot or "vietnam" in ot or "viet nam" in ot:
+                    Select(sel_el).select_by_value(opt.get_attribute("value"))
+                    time.sleep(0.4)
+                    value_to_type = phone_local
+                    break
+            break
+    except Exception:
+        pass
+
+    # 2. Nhập số vào ô input
+    try:
+        phone_inp.click()
+    except Exception:
+        pass
+    try:
+        phone_inp.send_keys(Keys.CONTROL, "a")
+        phone_inp.send_keys(Keys.BACKSPACE)
+    except Exception:
+        pass
+    safe_send_keys(phone_inp, value_to_type, delay=0.6)
+
+    # 3. Kiểm tra Material combobox nếu chưa tự chuyển sang +84 / Vietnam
+    if value_to_type == phone_e164:
+        try:
+            combos = [c for c in driver.find_elements(By.CSS_SELECTOR, "[role='combobox']") if c.is_displayed()]
+            if combos:
+                combo = combos[0]
+                combo_meta = _normalize_prompt_text(
+                    (combo.text or "") + " " + (combo.get_attribute("aria-label") or "")
+                )
+                if not any(k in combo_meta for k in ("vietnam", "viet nam", "+84")):
+                    if safe_click(combo, delay=0.6):
+                        vn_opts = [
+                            o for o in driver.find_elements(
+                                By.XPATH,
+                                "//*[@role='option' and (@data-value='vn' or @data-value='VN' or contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'vietnam') or contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'vietnam') or contains(., '+84') or contains(., 'Việt Nam'))]"
+                                " | //li[@data-value='vn' or @data-value='VN']",
+                            )
+                            if o.is_displayed()
+                        ]
+                        if vn_opts:
+                            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", vn_opts[0])
+                            if not safe_click(vn_opts[0], delay=0.5):
+                                driver.execute_script("arguments[0].click();", vn_opts[0])
+                                time.sleep(0.5)
+                            phone_inp.send_keys(Keys.CONTROL, "a")
+                            phone_inp.send_keys(Keys.BACKSPACE)
+                            safe_send_keys(phone_inp, phone_local, delay=0.5)
+                        else:
+                            phone_inp.send_keys(Keys.ESCAPE)
+                            time.sleep(0.3)
+        except Exception:
+            pass
+
+
+def _click_google_phone_submit(driver: WebDriver, input_el=None) -> None:
+    """Bấm nút Next / Send / Get code / Verify trên màn hình xác minh SĐT Google."""
+    btns = [
+        b for b in driver.find_elements(
+            By.CSS_SELECTOR,
+            "#idvanyphonecollectNext button, #idvanyphonecollectNext, "
+            "#idvanyphoneverifyNext button, #idvanyphoneverifyNext, "
+            "#next button, #next, button[type='submit'], input[type='submit']",
+        )
+        if b.is_displayed()
+    ]
+    if not btns:
+        btns = [
+            b for b in driver.find_elements(By.XPATH, "//button | //div[@role='button']")
+            if b.is_displayed()
+            and any(
+                _normalize_prompt_text(b.text or "") == k or k in _normalize_prompt_text(b.text or "")
+                for k in ("next", "tiếp theo", "tiếp", "send", "gửi", "get code", "nhận mã", "verify", "xác minh")
+            )
+        ]
+    if btns:
+        if not safe_click(btns[0], delay=1.5):
+            driver.execute_script("arguments[0].click();", btns[0])
+            time.sleep(1.5)
+    elif input_el is not None:
+        input_el.send_keys(Keys.RETURN)
+        time.sleep(1.5)
+
+
+def _extract_google_phone_error(driver: WebDriver, body_low: str, keywords: Tuple[str, ...]) -> str:
+    """Tìm thông báo lỗi Google từ chối SĐT hoặc sai mã OTP."""
+    try:
+        for alert in driver.find_elements(By.CSS_SELECTOR, "[role='alert'], [aria-live='assertive'], .Ekjuhf, .o6cuMc"):
+            if not alert.is_displayed():
+                continue
+            txt = (alert.text or "").strip()
+            txt_norm = _normalize_prompt_text(txt)
+            if txt_norm and any(k in txt_norm for k in keywords):
+                return txt
+    except Exception:
+        pass
+
+    for k in keywords:
+        if k in body_low:
+            return k
+    return ""
+
+
+def _try_enter_phone_challenge_from_selection(driver: WebDriver, cur_url_low: str) -> bool:
+    """Nếu đang ở màn hình chọn phương thức verify, click tùy chọn nhập SĐT mới (không click SĐT cũ bị che)."""
+    if "/signin/challenge/selection" not in cur_url_low:
+        return False
+    try:
+        tiles = driver.find_elements(
+            By.XPATH,
+            "//*[@data-challengetype='9']"
+            " | //li[.//*[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'enter a phone number') or contains(., 'nhập số điện thoại')]]"
+            " | //div[@role='link' or @role='button'][contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'enter a phone number') or contains(., 'nhập số điện thoại')]",
+        )
+        for t in tiles:
+            if not t.is_displayed():
+                continue
+            meta = _normalize_prompt_text(t.text or "")
+            if "•" in (t.text or "") or "*" in (t.text or ""):
+                continue
+            if meta:
+                logger.info("Chọn xác minh bằng tùy chọn 'Enter a phone number'...")
+                if not safe_click(t, delay=2.0):
+                    driver.execute_script("arguments[0].click();", t)
+                    time.sleep(2.0)
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _verify_google_sms_challenge(
+    driver: WebDriver,
+    hupsms_api_key: str,
+    hupsms_service_id: int = 0,
+    hupsms_network: str = "",
+    hupsms_prefix: str = "",
+    sms_timeout: int = 180,
+    max_attempts: int = 2,
+) -> bool:
+    """
+    Tự động thuê SIM VN qua HupSMS, nhập số lên màn hình Google và điền mã OTP SMS.
+    Trả về True nếu xử lý xong bước verify SĐT; False nếu màn hình không phải nhập SĐT mới (hoặc bị Captcha).
+    """
+    api_key_clean = (hupsms_api_key or "").strip()
+    if not api_key_clean:
+        return False
+
+    cur_u = (driver.current_url or "").lower()
+    body_low = _normalize_prompt_text(driver.execute_script("return document.body ? document.body.innerText : '';") or "")
+
+    if _has_visible_google_captcha(driver, body_low):
+        return False
+    if _is_skippable_google_phone_nudge(driver, cur_u):
+        return False
+
+    phone_inp = _find_visible_phone_input(driver)
+    if phone_inp is None and _try_enter_phone_challenge_from_selection(driver, cur_u):
+        cur_u = (driver.current_url or "").lower()
+        body_low = _normalize_prompt_text(driver.execute_script("return document.body ? document.body.innerText : '';") or "")
+        if _has_visible_google_captcha(driver, body_low):
+            return False
+        phone_inp = _find_visible_phone_input(driver)
+
+    if phone_inp is None:
+        return False
+
+    client = HupSmsClient(api_key=api_key_clean)
+    attempts = max(1, int(max_attempts or 1))
+    last_error = "Không xác minh được SĐT Gmail qua HupSMS"
+
+    for attempt in range(1, attempts + 1):
+        check_browser_alive(driver)
+        phone_inp = _find_visible_phone_input(driver)
+        if phone_inp is None:
+            raise LoginFailedError(last_error)
+
+        try:
+            order = client.rent_google_number(
+                service_id=int(hupsms_service_id or 0),
+                network=hupsms_network,
+                prefix=hupsms_prefix,
+                stop_check=lambda: check_browser_alive(driver),
+            )
+        except HupSmsError as e:
+            raise LoginFailedError(f"HupSMS không thuê được SIM VN: {e}") from e
+
+        order_id = str(order.get("orderId", "")).strip()
+        phone_local = str(order.get("phoneLocal") or order.get("phone") or "").strip()
+        phone_e164 = str(order.get("phoneE164") or phone_local).strip()
+        logger.info(
+            f"📱 [HupSMS {attempt}/{attempts}] Đã thuê {phone_local} "
+            f"({order.get('serviceName', 'Google/Gmail')} - {order.get('server', '?')}, "
+            f"{order.get('price', '?')}đ, order={order_id})"
+        )
+
+        otp_screen_ready = False
+        phone_rejected_reason = ""
+        order_completed = False
+        try:
+            _select_sms_delivery_option_if_present(driver)
+            _select_vn_country_and_enter_phone(driver, phone_inp, phone_e164, phone_local)
+            _click_google_phone_submit(driver, phone_inp)
+
+            for _ in range(12):
+                time.sleep(1.0)
+                check_browser_alive(driver)
+                u_now = (driver.current_url or "").lower()
+                b_now = _normalize_prompt_text(
+                    driver.execute_script("return document.body ? document.body.innerText : '';") or ""
+                )
+                if _has_visible_google_captcha(driver, b_now):
+                    client.cancel_order(order_id, ignore_errors=True)
+                    raise LoginFailedError("Google yêu cầu giải Captcha sau khi nhập SĐT")
+                if _find_visible_phone_otp_input(driver, u_now, b_now) is not None:
+                    otp_screen_ready = True
+                    break
+                if any(k in u_now for k in ("mail.google.com/mail", "speedbump", "gds.google.com", "myaccount.google.com", "passkeyenrollment")):
+                    logger.info(f"✅ Google tự qua bước xác minh SĐT với {phone_local}!")
+                    return True
+                err_txt = _extract_google_phone_error(driver, b_now, _GOOGLE_PHONE_REJECT_KEYWORDS)
+                if err_txt:
+                    phone_rejected_reason = err_txt
+                    break
+
+            if not otp_screen_ready:
+                client.cancel_order(order_id, ignore_errors=True)
+                last_error = (
+                    f"Google từ chối số {phone_local}: {phone_rejected_reason}"
+                    if phone_rejected_reason
+                    else f"Google không chuyển sang bước nhập OTP cho số {phone_local}"
+                )
+                logger.warning(f"⚠️ {last_error}")
+                if attempt < attempts:
+                    continue
+                raise LoginFailedError(last_error)
+
+            logger.info(f"⏳ Đang chờ HupSMS nhận OTP cho {phone_local} (order={order_id}, timeout={sms_timeout}s)...")
+            otp_data = client.wait_for_otp(
+                order_id,
+                timeout=sms_timeout,
+                poll_interval=4.0,
+                auto_cancel_on_timeout=True,
+                stop_check=lambda: check_browser_alive(driver),
+            )
+            order_completed = True
+            otp_code = str(otp_data.get("code", "")).strip()
+            logger.info(f"📩 Nhận được OTP SMS từ {phone_local}: {otp_code}")
+
+            otp_inp = _find_visible_phone_otp_input(
+                driver,
+                (driver.current_url or "").lower(),
+                _normalize_prompt_text(driver.execute_script("return document.body ? document.body.innerText : '';") or ""),
+            )
+            if otp_inp is None:
+                raise LoginFailedError("Không tìm thấy ô nhập mã OTP trên Google sau khi nhận SMS")
+
+            try:
+                otp_inp.click()
+                otp_inp.send_keys(Keys.CONTROL, "a")
+                otp_inp.send_keys(Keys.BACKSPACE)
+            except Exception:
+                pass
+            safe_send_keys(otp_inp, otp_code, delay=0.8)
+            _click_google_phone_submit(driver, otp_inp)
+
+            for _ in range(12):
+                time.sleep(1.0)
+                check_browser_alive(driver)
+                u_after = (driver.current_url or "").lower()
+                b_after = _normalize_prompt_text(
+                    driver.execute_script("return document.body ? document.body.innerText : '';") or ""
+                )
+                otp_err = _extract_google_phone_error(driver, b_after, _GOOGLE_OTP_REJECT_KEYWORDS)
+                if otp_err:
+                    raise LoginFailedError(f"Google từ chối mã OTP {otp_code} ({otp_err})")
+                if "/signin/challenge/iap" not in u_after and _find_visible_phone_otp_input(driver, u_after, b_after) is None:
+                    logger.info(f"✅ Xác minh SĐT Gmail thành công bằng HupSMS ({phone_local})!")
+                    return True
+                if any(k in u_after for k in ("mail.google.com/mail", "speedbump", "gds.google.com", "myaccount.google.com", "passkeyenrollment")):
+                    logger.info(f"✅ Xác minh SĐT Gmail thành công bằng HupSMS ({phone_local})!")
+                    return True
+
+            if _find_visible_phone_otp_input(driver, (driver.current_url or "").lower(), "") is None:
+                return True
+            raise LoginFailedError(f"Đã nhập OTP {otp_code} nhưng Google vẫn giữ ở màn hình xác minh SĐT")
+
+        except (BrowserClosedError, LoginFailedError):
+            if not order_completed:
+                client.cancel_order(order_id, ignore_errors=True)
+            raise
+        except HupSmsError as e:
+            if e.code not in ("OTP_TIMEOUT", "ORDER_EXPIRED", "ORDER_CANCELLED"):
+                client.cancel_order(order_id, ignore_errors=True)
+            last_error = f"HupSMS lỗi với số {phone_local}: {e}"
+            logger.warning(f"⚠️ {last_error}")
+            if attempt < attempts and _find_visible_phone_input(driver) is not None:
+                continue
+            raise LoginFailedError(last_error) from e
+        except Exception as e:
+            if not order_completed:
+                client.cancel_order(order_id, ignore_errors=True)
+            if is_browser_closed_exception(e):
+                raise BrowserClosedError(str(e)) from e
+            raise LoginFailedError(f"Lỗi xác minh SĐT Gmail qua HupSMS: {e}") from e
+
+    raise LoginFailedError(last_error)
+
+
 def _handle_google_post_login_prompts(
     driver: WebDriver,
     gmail_email: str = "",
     recovery_email: str = "",
     twofa_secret: str = "",
+    gmail_password: str = "",
+    hupsms_api_key: Optional[str] = None,
+    hupsms_service_id: Optional[int] = None,
+    hupsms_network: Optional[str] = None,
+    hupsms_prefix: Optional[str] = None,
 ) -> None:
     """
-    Xử lý các bước xác minh 2FA / Email khôi phục / Passkey / Speedbump sau khi nhập mật khẩu Google.
+    Xử lý các bước xác minh Mật khẩu / 2FA / Email khôi phục / SMS SĐT (HupSMS) / Passkey / Speedbump sau khi đăng nhập Google.
     """
+    sms_key = (getattr(config, "HUPSMS_API_KEY", "") if hupsms_api_key is None else hupsms_api_key) or ""
+    sms_sid = int(getattr(config, "HUPSMS_SERVICE_ID", 0) if hupsms_service_id is None else hupsms_service_id or 0)
+    sms_net = (getattr(config, "HUPSMS_NETWORK", "") if hupsms_network is None else hupsms_network) or ""
+    sms_pre = (getattr(config, "HUPSMS_PREFIX", "") if hupsms_prefix is None else hupsms_prefix) or ""
+    sms_timeout = int(getattr(config, "HUPSMS_SMS_TIMEOUT", 180) or 180)
+    sms_retries = int(getattr(config, "HUPSMS_MAX_RETRIES", 2) or 2)
+
     for _ in range(8):
         check_browser_alive(driver)
         time.sleep(2)
@@ -130,7 +659,29 @@ def _handle_google_post_login_prompts(
         driver.implicitly_wait(0)
         try:
             body_txt = (driver.execute_script("return document.body ? document.body.innerText : '';") or "")
-            body_low = body_txt.lower()
+            body_low = _normalize_prompt_text(body_txt)
+
+            # 0. Nếu gặp lại màn hình nhập mật khẩu (vd sau bước challenge trước đó)
+            if gmail_password:
+                pwd_inps = [
+                    e for e in driver.find_elements(By.CSS_SELECTOR, "input[name='Passwd'], #password input[type='password'], input[type='password']")
+                    if e.is_displayed()
+                ]
+                if pwd_inps:
+                    logger.info("Điền mật khẩu Google ở bước tiếp theo...")
+                    safe_send_keys(pwd_inps[0], gmail_password, delay=0.8)
+                    pwd_next = [
+                        b for b in driver.find_elements(By.CSS_SELECTOR, "#passwordNext button, #passwordNext")
+                        if b.is_displayed()
+                    ]
+                    if pwd_next:
+                        if not safe_click(pwd_next[0], delay=2.5):
+                            driver.execute_script("arguments[0].click();", pwd_next[0])
+                            time.sleep(2.5)
+                    else:
+                        pwd_inps[0].send_keys(Keys.RETURN)
+                        time.sleep(2.5)
+                    continue
 
             # 1. Ô nhập mã 2FA Authenticator (totpPin)
             totp_inps = [
@@ -225,17 +776,44 @@ def _handle_google_post_login_prompts(
                     time.sleep(3)
                     return
 
-            # 5. Nếu gặp Captcha hoặc xác minh thủ công của Google -> chờ người dùng hoặc GemCaptcha giải
-            if "captcha" in body_low or "verify it's you" in body_low or "xác minh danh tính" in body_low:
-                logger.info("⏳ Phát hiện bước xác minh bổ sung của Google, đang chờ hoàn tất...")
-                for _ in range(20):
+            # 5. Nếu gặp xác minh SĐT / Captcha / danh tính Google
+            manual_reason = _detect_google_manual_verification(cur_u, body_low)
+            if manual_reason or _find_visible_phone_input(driver) is not None:
+                if sms_key.strip() and _verify_google_sms_challenge(
+                    driver,
+                    hupsms_api_key=sms_key,
+                    hupsms_service_id=sms_sid,
+                    hupsms_network=sms_net,
+                    hupsms_prefix=sms_pre,
+                    sms_timeout=sms_timeout,
+                    max_attempts=sms_retries,
+                ):
+                    continue
+
+                reason_msg = manual_reason or "Google yêu cầu xác minh SĐT (Verify it's you)"
+                wait_cfg = max(0, int(getattr(config, "CAPTCHA_TIMEOUT", 60)))
+                max_wait = min(wait_cfg, 60)
+                logger.info(f"⏳ Phát hiện {reason_msg}, đang chờ tối đa {max_wait}s để hoàn tất...")
+                resolved = False
+                waited = 0
+                while waited < max_wait:
                     time.sleep(3)
+                    waited += 3
                     check_browser_alive(driver)
                     u_now = (driver.current_url or "").lower()
-                    if "mail.google.com/mail" in u_now or "myaccount.google.com" in u_now:
+                    b_now = _normalize_prompt_text(
+                        driver.execute_script("return document.body ? document.body.innerText : '';") or ""
+                    )
+                    if any(k in u_now for k in ("mail.google.com/mail", "myaccount.google.com", "gds.google.com", "speedbump")):
+                        resolved = True
                         break
-                continue
-        except BrowserClosedError:
+                    if not _detect_google_manual_verification(u_now, b_now):
+                        resolved = True
+                        break
+                if resolved:
+                    continue
+                raise LoginFailedError(reason_msg)
+        except (BrowserClosedError, LoginFailedError):
             raise
         except Exception as e:
             if is_browser_closed_exception(e):
@@ -253,6 +831,10 @@ def login_gmail(
     gmail_password: str,
     recovery_email: str = "",
     twofa_secret: str = "",
+    hupsms_api_key: Optional[str] = None,
+    hupsms_service_id: Optional[int] = None,
+    hupsms_network: Optional[str] = None,
+    hupsms_prefix: Optional[str] = None,
 ) -> bool:
     """
     Bước 1a (Tab Reg Gmail): Đăng nhập tài khoản Gmail trên trình duyệt Gemlogin.
@@ -413,13 +995,33 @@ def login_gmail(
         except Exception:
             pass
 
-        _handle_google_post_login_prompts(driver, gmail_clean, recovery_email, twofa_secret)
+        _handle_google_post_login_prompts(
+            driver,
+            gmail_clean,
+            recovery_email,
+            twofa_secret,
+            gmail_password=gmail_password,
+            hupsms_api_key=hupsms_api_key,
+            hupsms_service_id=hupsms_service_id,
+            hupsms_network=hupsms_network,
+            hupsms_prefix=hupsms_prefix,
+        )
 
         if not _is_gmail_inbox_loaded(driver):
             _safe_get(driver, GMAIL_INBOX_URL)
             wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
             time.sleep(3)
-            _handle_google_post_login_prompts(driver, gmail_clean, recovery_email, twofa_secret)
+            _handle_google_post_login_prompts(
+                driver,
+                gmail_clean,
+                recovery_email,
+                twofa_secret,
+                gmail_password=gmail_password,
+                hupsms_api_key=hupsms_api_key,
+                hupsms_service_id=hupsms_service_id,
+                hupsms_network=hupsms_network,
+                hupsms_prefix=hupsms_prefix,
+            )
 
         if _is_gmail_inbox_loaded(driver):
             _dismiss_gmail_popups(driver)
@@ -537,28 +1139,43 @@ def _fetch_nmc_fwd_browser(driver: WebDriver, forward_email: str) -> Tuple[str, 
         if prefix_inp:
             safe_send_keys(prefix_inp, prefix, delay=0.4)
             for _ in range(5):
-                check_btn = wait_for_element(
-                    driver, By.XPATH, "//button[contains(text(), 'Kiểm tra Thư')]", timeout=5, condition="clickable"
-                )
-                if check_btn:
-                    safe_click(check_btn, delay=3.0)
-                mail_items = [
-                    el for el in driver.find_elements(By.CSS_SELECTOR, ".mail-item")
-                    if el.is_displayed()
-                ]
-                for item in mail_items[:5]:
-                    subj_txt = item.text or ""
-                    safe_click(item, delay=1.2)
-                    view_body = wait_for_element(driver, By.ID, "view-body", timeout=4, condition="visible")
-                    if view_body:
-                        combined_body = (view_body.get_attribute("innerHTML") or "") + "\n" + (view_body.text or "")
-                        code, vf_link = _extract_gmail_fwd_code_and_link(subj_txt, combined_body)
-                        if code or vf_link:
-                            logger.info(
-                                f"✅ Lấy được xác nhận Gmail Forwarding trên web mail.nguyenmaucole.io.vn "
-                                f"(code={code or 'N/A'}, link={'CÓ' if vf_link else 'KHÔNG'})"
-                            )
-                            return code, vf_link
+                try:
+                    check_btn = wait_for_element(
+                        driver, By.XPATH, "//button[contains(text(), 'Kiểm tra Thư')]", timeout=5, condition="clickable"
+                    )
+                    if check_btn:
+                        if not safe_click(check_btn, delay=3.0):
+                            driver.execute_script("arguments[0].click();", check_btn)
+                            time.sleep(3.0)
+                except Exception:
+                    time.sleep(1.5)
+
+                for item_idx in range(5):
+                    try:
+                        mail_items = [
+                            el for el in driver.find_elements(By.CSS_SELECTOR, ".mail-item")
+                            if el.is_displayed()
+                        ]
+                        if item_idx >= len(mail_items):
+                            break
+                        item = mail_items[item_idx]
+                        subj_txt = item.text or ""
+                        if not safe_click(item, delay=1.2):
+                            driver.execute_script("arguments[0].click();", item)
+                            time.sleep(1.2)
+                        view_body = wait_for_element(driver, By.ID, "view-body", timeout=4, condition="visible")
+                        if view_body:
+                            combined_body = (view_body.get_attribute("innerHTML") or "") + "\n" + (view_body.text or "")
+                            code, vf_link = _extract_gmail_fwd_code_and_link(subj_txt, combined_body)
+                            if code or vf_link:
+                                logger.info(
+                                    f"✅ Lấy được xác nhận Gmail Forwarding trên web mail.nguyenmaucole.io.vn "
+                                    f"(code={code or 'N/A'}, link={'CÓ' if vf_link else 'KHÔNG'})"
+                                )
+                                return code, vf_link
+                    except Exception:
+                        time.sleep(0.5)
+                        continue
                 time.sleep(2.0)
     except Exception as e:
         logger.debug(f"Fallback web mail.nguyenmaucole.io.vn lỗi: {e}")
@@ -989,8 +1606,26 @@ def _click_fwd_verify_button(driver: WebDriver, near_input=None) -> bool:
 
 
 def _get_forwarding_select_emails(driver: WebDriver) -> list:
-    """Lấy danh sách các địa chỉ email ĐÃ XÁC MINH có trong dropdown chọn email chuyển tiếp."""
+    """
+    Lấy danh sách các địa chỉ email ĐÃ XÁC MINH từ giao diện #settings/fwdandpop:
+      - Các <option> trong dropdown chọn email chuyển tiếp
+      - Giá trị <input> / HTML trong hàng radio 'Chuyển tiếp bản sao...' (khi chỉ có 1 địa chỉ, Gmail ẩn dropdown)
+      - Banner xác nhận đang bật ('Bạn đang chuyển tiếp email của mình đến ...')
+    """
     emails = []
+    email_pat = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+
+    def _add(addr: str) -> None:
+        raw = unicodedata.normalize("NFC", (addr or "")).strip().lower()
+        if any(raw.startswith(p) for p in ("xóa ", "xoá ", "remove ", "delete ")):
+            return
+        m = email_pat.search(raw)
+        if not m:
+            return
+        a = m.group(0).strip().rstrip(".,;")
+        if a not in emails:
+            emails.append(a)
+
     driver.implicitly_wait(0)
     try:
         radios = driver.find_elements(By.CSS_SELECTOR, "input[type='radio'][name='sx_em'][value='1']")
@@ -999,6 +1634,14 @@ def _get_forwarding_select_emails(driver: WebDriver) -> list:
             try:
                 row_tr = radios[0].find_element(By.XPATH, "./ancestor::tr[1]")
                 search_selects = row_tr.find_elements(By.TAG_NAME, "select")
+                for inp in row_tr.find_elements(By.TAG_NAME, "input"):
+                    if (inp.get_attribute("type") or "").lower() != "radio":
+                        _add(inp.get_attribute("value") or "")
+                # Chỉ quét HTML ngoài thẻ <select> để tránh nhận nhầm <option>Xóa unverified@...</option>
+                row_html = row_tr.get_attribute("innerHTML") or ""
+                row_html_no_sel = re.sub(r"<select\b[^>]*>[\s\S]*?</select>", " ", row_html, flags=re.IGNORECASE)
+                for found in email_pat.findall(row_html_no_sel):
+                    _add(found)
             except Exception:
                 pass
         if not search_selects:
@@ -1006,11 +1649,23 @@ def _get_forwarding_select_emails(driver: WebDriver) -> list:
 
         for sel_el in search_selects:
             for opt in sel_el.find_elements(By.TAG_NAME, "option"):
-                txt = (opt.text or "").strip().lower()
-                val = (opt.get_attribute("value") or "").strip().lower()
+                txt = unicodedata.normalize("NFC", (opt.text or "")).strip().lower()
+                val = unicodedata.normalize("NFC", (opt.get_attribute("value") or "")).strip().lower()
+                if any(k in txt for k in ("xóa ", "xoá ", "remove ", "delete ")):
+                    continue
                 for cand in (txt, val):
-                    if "@" in cand and cand not in emails:
-                        emails.append(cand)
+                    if "@" in cand:
+                        _add(cand)
+
+        body_raw = driver.execute_script("return document.body ? document.body.innerText : '';") or ""
+        body_nfc = unicodedata.normalize("NFC", body_raw).lower()
+        for m in re.finditer(
+            r"(?:đang chuyển tiếp email của mình đến|forwarding your email to|"
+            r"chuyển tiếp bản sao của thư đến tới|forwarding a copy of incoming mail to)"
+            r"\s+([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
+            body_nfc,
+        ):
+            _add(m.group(1))
     except Exception:
         pass
     finally:
@@ -1019,6 +1674,108 @@ def _get_forwarding_select_emails(driver: WebDriver) -> list:
         except Exception:
             pass
     return emails
+
+
+def _find_existing_forwarding_row_email(
+    driver: WebDriver,
+    target_domains: Tuple[str, ...],
+    exclude_email: str = "",
+) -> str:
+    """
+    Kiểm tra hàng 'Chuyển tiếp bản sao của thư đến tới:' trên #settings/fwdandpop.
+    Nếu đã có sẵn email thuộc domain mục tiêu (vd: @nguyenmaucole.io.vn), trả về địa chỉ đó.
+    """
+    doms = tuple(dict.fromkeys(d.strip().lstrip("@").lower() for d in target_domains if (d or "").strip()))
+    if not doms:
+        return ""
+    exclude_low = (exclude_email or "").strip().lower()
+    email_pat = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+
+    candidates = []
+
+    def _push(raw_str: str) -> None:
+        norm = unicodedata.normalize("NFC", (raw_str or "")).strip().lower()
+        if not norm:
+            return
+        if any(norm.startswith(p) for p in ("xóa ", "xoá ", "remove ", "delete ")):
+            return
+        if any(k in norm for k in ("đang chờ", "in use", "pending")):
+            return
+        for m in email_pat.finditer(norm):
+            addr = m.group(0).strip().rstrip(".,;")
+            if addr and addr != exclude_low and addr not in candidates:
+                candidates.append(addr)
+
+    driver.implicitly_wait(0)
+    try:
+        radios = driver.find_elements(By.CSS_SELECTOR, "input[type='radio'][name='sx_em'][value='1']")
+        row_tr = None
+        search_selects = []
+        if radios:
+            target_radio = next((r for r in radios if r.is_displayed()), radios[0])
+            try:
+                row_tr = target_radio.find_element(By.XPATH, "./ancestor::tr[1]")
+            except Exception:
+                row_tr = None
+
+        # Ưu tiên 1: Giá trị đang hiện trực tiếp trong ô <input> hoặc <option> đang chọn của hàng 'Chuyển tiếp bản sao...'
+        if row_tr is not None:
+            for inp in row_tr.find_elements(By.TAG_NAME, "input"):
+                if (inp.get_attribute("type") or "").lower() != "radio":
+                    _push(inp.get_attribute("value") or "")
+            search_selects = row_tr.find_elements(By.TAG_NAME, "select")
+            for sel_el in search_selects:
+                try:
+                    sel_opt = Select(sel_el).first_selected_option
+                    _push((sel_opt.text or "") + " " + (sel_opt.get_attribute("value") or ""))
+                except Exception:
+                    pass
+
+        # Ưu tiên 2: Banner đang chuyển tiếp & nội dung text/HTML ngoài <select> trong hàng 'Chuyển tiếp bản sao...'
+        body_raw = driver.execute_script("return document.body ? document.body.innerText : '';") or ""
+        body_nfc = unicodedata.normalize("NFC", body_raw).lower()
+        for m in re.finditer(
+            r"(?:đang chuyển tiếp email của mình đến|forwarding your email to|"
+            r"chuyển tiếp bản sao của thư đến tới|forwarding a copy of incoming mail to)"
+            r"\s+([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
+            body_nfc,
+        ):
+            _push(m.group(1))
+
+        if row_tr is not None:
+            _push(row_tr.text or "")
+            try:
+                row_html = row_tr.get_attribute("innerHTML") or ""
+                row_html_no_sel = re.sub(r"<select\b[^>]*>[\s\S]*?</select>", " ", row_html, flags=re.IGNORECASE)
+                _push(row_html_no_sel)
+            except Exception:
+                pass
+
+        # Ưu tiên 3: Các <option> hợp lệ khác nằm trong <select> của hàng chuyển tiếp
+        if not search_selects:
+            search_selects = driver.find_elements(By.TAG_NAME, "select")
+        for sel_el in search_selects:
+            for opt in sel_el.find_elements(By.TAG_NAME, "option"):
+                txt = unicodedata.normalize("NFC", (opt.text or "")).strip().lower()
+                val = unicodedata.normalize("NFC", (opt.get_attribute("value") or "")).strip().lower()
+                if any(k in txt for k in ("xóa ", "xoá ", "remove ", "delete ", "đang chờ", "pending", "in use")):
+                    continue
+                _push(txt)
+                _push(val)
+    except Exception:
+        pass
+    finally:
+        try:
+            driver.implicitly_wait(5)
+        except Exception:
+            pass
+
+    for dom in doms:
+        suffix = f"@{dom}"
+        for addr in candidates:
+            if addr.endswith(suffix):
+                return addr
+    return ""
 
 
 def _handle_gmail_forwarding_popups(
@@ -1035,6 +1792,7 @@ def _handle_gmail_forwarding_popups(
       - Hộp thoại thông báo 'Mã xác nhận đã được gửi...' / 'A confirmation code has been sent...' -> bấm 'OK' / 'Đã hiểu'
     """
     clicked_ok_alert = False
+    seen_pop_sig = set()
     for attempt_idx in range(28):
         time.sleep(1.0)
         check_browser_alive(driver)
@@ -1110,6 +1868,11 @@ def _handle_gmail_forwarding_popups(
             try:
                 driver.switch_to.window(pop_h)
                 pop_url = (driver.current_url or "").lower()
+                pop_title = (driver.title or "").strip()
+                sig = (pop_h, pop_url.split("?", 1)[0], pop_title)
+                if sig not in seen_pop_sig:
+                    seen_pop_sig.add(sig)
+                    logger.info(f"Đang xử lý popup Gmail Forwarding: {pop_url.split('?', 1)[0]} | title={pop_title!r}")
                 driver.implicitly_wait(0)
                 body_pop = (driver.execute_script("return document.body ? document.body.innerText : '';") or "").lower()
 
@@ -1127,7 +1890,9 @@ def _handle_gmail_forwarding_popups(
                             if b.is_displayed()
                         ]
                         if next_btns:
-                            safe_click(next_btns[0], delay=2.5)
+                            if not safe_click(next_btns[0], delay=2.5):
+                                driver.execute_script("arguments[0].click();", next_btns[0])
+                                time.sleep(2.5)
                         else:
                             pwd_els[0].send_keys(Keys.RETURN)
                             time.sleep(2.5)
@@ -1138,6 +1903,7 @@ def _handle_gmail_forwarding_popups(
                         if e.is_displayed()
                     ]
                     if totp_els and twofa_secret:
+                        logger.info("Popup xác thực Gmail Forwarding yêu cầu nhập mã 2FA...")
                         code = generate_2fa_code(twofa_secret)
                         safe_send_keys(totp_els[0], code, delay=0.8)
                         totp_els[0].send_keys(Keys.RETURN)
@@ -1149,33 +1915,44 @@ def _handle_gmail_forwarding_popups(
                         try_btns = [
                             b for b in driver.find_elements(
                                 By.XPATH,
-                                "//button[contains(., 'Try another way') or contains(., 'Thử cách khác')]",
+                                "//button[contains(., 'Try another way') or contains(., 'Thử cách khác')]"
+                                " | //div[@role='button'][contains(., 'Try another way') or contains(., 'Thử cách khác')]",
                             )
                             if b.is_displayed()
                         ]
                         if try_btns:
-                            safe_click(try_btns[0], delay=2.0)
+                            logger.info("Popup xác thực Gmail Forwarding hiện Passkey -> bấm 'Try another way' / 'Thử cách khác'")
+                            if not safe_click(try_btns[0], delay=2.0):
+                                driver.execute_script("arguments[0].click();", try_btns[0])
+                                time.sleep(2.0)
                             continue
                         pwd_opt = [
                             el for el in driver.find_elements(
                                 By.XPATH,
-                                "//li[.//*[contains(., 'Enter your password') or contains(., 'Nhập mật khẩu')]]",
+                                "//li[.//*[contains(., 'Enter your password') or contains(., 'Nhập mật khẩu') or contains(., 'Confirm your password') or contains(., 'Xác nhận mật khẩu')]]"
+                                " | //div[@role='link' or @role='button'][contains(., 'Enter your password') or contains(., 'Nhập mật khẩu') or contains(., 'Confirm your password') or contains(., 'Xác nhận mật khẩu')]",
                             )
                             if el.is_displayed()
                         ]
                         if pwd_opt:
-                            safe_click(pwd_opt[0], delay=2.0)
+                            logger.info("Popup xác thực Gmail Forwarding chọn xác minh bằng mật khẩu...")
+                            if not safe_click(pwd_opt[0], delay=2.0):
+                                driver.execute_script("arguments[0].click();", pwd_opt[0])
+                                time.sleep(2.0)
                             continue
 
                     cont_btns = [
                         b for b in driver.find_elements(
                             By.XPATH,
-                            "//button[.//span[normalize-space()='Continue' or normalize-space()='Tiếp tục'] or normalize-space()='Continue' or normalize-space()='Tiếp tục']",
+                            "//button[.//span[normalize-space()='Continue' or normalize-space()='Tiếp tục' or normalize-space()='Next' or normalize-space()='Tiếp theo'] or normalize-space()='Continue' or normalize-space()='Tiếp tục' or normalize-space()='Next' or normalize-space()='Tiếp theo']",
                         )
                         if b.is_displayed()
                     ]
                     if cont_btns:
-                        safe_click(cont_btns[0], delay=2.0)
+                        logger.info("Popup accounts.google.com bấm 'Continue' / 'Next'...")
+                        if not safe_click(cont_btns[0], delay=2.0):
+                            driver.execute_script("arguments[0].click();", cont_btns[0])
+                            time.sleep(2.0)
                         continue
 
                 # 2. Popup 'Confirm forwarding address' / 'Xác nhận địa chỉ chuyển tiếp' có nút 'Proceed' / 'Tiếp tục'
@@ -1209,6 +1986,11 @@ def _handle_gmail_forwarding_popups(
                     pass
 
     # Đảm bảo chuyển về tab chính và bấm nút 'OK' trên thông báo 'Đã gửi mã xác nhận...' (nếu còn)
+    if not clicked_ok_alert:
+        logger.warning(
+            f"Hết vòng chờ popup Gmail Forwarding mà chưa đóng được hộp thoại OK "
+            f"(window_handles={len(driver.window_handles)})"
+        )
     if main_handle in driver.window_handles:
         driver.switch_to.window(main_handle)
         time.sleep(1.5)
@@ -1216,62 +1998,155 @@ def _handle_gmail_forwarding_popups(
             logger.info("Đã đóng hộp thoại 'OK' sau khi gửi OTP xác nhận Gmail Forwarding")
 
 
-def _enable_and_save_gmail_forwarding(driver: WebDriver, forward_email: str, force_reload: bool = True) -> bool:
+def _reload_gmail_fwd_settings(driver: WebDriver) -> None:
+    """Reload thật sự trang #settings/fwdandpop (tránh bị Chrome bỏ qua do trùng hash URL)."""
+    cur = (driver.current_url or "").lower()
+    if "mail.google.com" in cur:
+        try:
+            driver.refresh()
+            wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
+        except Exception:
+            pass
+    if "#settings/fwdandpop" not in (driver.current_url or "").lower():
+        _safe_get(driver, GMAIL_FWD_SETTINGS_URL)
+        wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
+    _wait_for_fwd_settings_ready(driver, timeout=15)
+    time.sleep(1.5)
+
+
+def _find_inline_forwarding_input(row_tr) -> Optional[object]:
+    """Tìm ô <input type='text'> inline nằm trong hàng radio 'Chuyển tiếp bản sao...' (Gmail Workspace)."""
+    try:
+        for el in row_tr.find_elements(
+            By.CSS_SELECTOR, "input[type='text'], input[type='email'], input:not([type])"
+        ):
+            if (
+                el.is_displayed()
+                and el.is_enabled()
+                and not el.get_attribute("disabled")
+                and not el.get_attribute("readonly")
+            ):
+                return el
+    except Exception:
+        pass
+    return None
+
+
+def _fill_inline_forwarding_input(driver: WebDriver, inp_el, forward_email: str) -> bool:
+    """Điền địa chỉ email chuyển tiếp vào ô input inline và kích hoạt sự kiện input/change."""
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", inp_el)
+        time.sleep(0.2)
+        safe_click(inp_el, delay=0.2)
+        inp_el.send_keys(Keys.CONTROL, "a")
+        inp_el.send_keys(Keys.BACKSPACE)
+        safe_send_keys(inp_el, forward_email, delay=0.4)
+        driver.execute_script(
+            "arguments[0].dispatchEvent(new Event('input', {bubbles: true}));"
+            "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));",
+            inp_el,
+        )
+        logger.info(f"Đã điền địa chỉ forwarding '{forward_email}' vào ô input inline trên Gmail")
+        return True
+    except Exception as e:
+        if is_browser_closed_exception(e):
+            raise BrowserClosedError(f"Trình duyệt đã bị đóng: {e}") from e
+        return False
+
+
+def _enable_and_save_gmail_forwarding(
+    driver: WebDriver,
+    forward_email: str,
+    force_reload: bool = True,
+    allow_fill_inline_input: bool = False,
+) -> bool:
     """
     Trên trang #settings/fwdandpop:
     1. Kiểm tra forward_email đã có trong danh sách địa chỉ đã xác minh chưa.
-    2. Chọn đúng forward_email trong dropdown.
+    2. Chọn đúng forward_email trong dropdown (hoặc điền ô input inline của Gmail Workspace khi đã xác minh).
     3. Tích chọn radio 'Chuyển tiếp bản sao của thư đến tới ...' / 'Forward a copy of incoming mail to ...' (input[name='sx_em'][value='1']).
     4. Bấm 'Lưu thay đổi' / 'Save Changes' ở cuối trang.
     """
-    if force_reload or "#settings/fwdandpop" not in (driver.current_url or "").lower():
+    if force_reload:
+        _reload_gmail_fwd_settings(driver)
+    elif "#settings/fwdandpop" not in (driver.current_url or "").lower():
         _safe_get(driver, GMAIL_FWD_SETTINGS_URL)
         wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
         _wait_for_fwd_settings_ready(driver, timeout=15)
         time.sleep(1.0)
     else:
-        time.sleep(2.0)
+        time.sleep(1.5)
 
-    enable_radio = wait_for_element(
-        driver,
-        By.CSS_SELECTOR,
-        "input[type='radio'][name='sx_em'][value='1']",
-        timeout=12,
-        condition="presence",
-    )
-    if not enable_radio:
-        logger.error("Chưa thấy tùy chọn 'Forward a copy of incoming mail to' (input[name='sx_em'][value='1']) trên Gmail")
-        return False
-
-    # Chọn đúng địa chỉ forward_email trong thẻ <select> cạnh radio
+    enable_radio = None
     selected_target_email = False
-    try:
-        row_tr = enable_radio.find_element(By.XPATH, "./ancestor::tr[1]")
-        selects = row_tr.find_elements(By.TAG_NAME, "select")
-        if not selects:
-            selects = driver.find_elements(By.TAG_NAME, "select")
-        for sel_el in selects:
-            opts = sel_el.find_elements(By.TAG_NAME, "option")
-            for idx, opt in enumerate(opts):
-                opt_combined = ((opt.text or "") + " " + (opt.get_attribute("value") or "")).lower()
-                if forward_email.lower() in opt_combined:
-                    Select(sel_el).select_by_index(idx)
-                    try:
-                        driver.execute_script(
-                            "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));", sel_el
-                        )
-                    except Exception:
-                        pass
-                    selected_target_email = True
-                    logger.info(f"Đã chọn địa chỉ forwarding '{forward_email}' trong dropdown")
+    filled_inline_input = False
+    row_text_debug = ""
+
+    for retry_idx in range(2):
+        enable_radio = wait_for_element(
+            driver,
+            By.CSS_SELECTOR,
+            "input[type='radio'][name='sx_em'][value='1']",
+            timeout=12,
+            condition="presence",
+        )
+        if not enable_radio:
+            logger.error("Chưa thấy tùy chọn 'Forward a copy of incoming mail to' (input[name='sx_em'][value='1']) trên Gmail")
+            return False
+
+        selected_target_email = False
+        try:
+            row_tr = enable_radio.find_element(By.XPATH, "./ancestor::tr[1]")
+            row_text_debug = (row_tr.text or "").strip().replace("\n", " ")[:180]
+            selects = row_tr.find_elements(By.TAG_NAME, "select")
+            if not selects:
+                selects = driver.find_elements(By.TAG_NAME, "select")
+            for sel_el in selects:
+                opts = sel_el.find_elements(By.TAG_NAME, "option")
+                for idx, opt in enumerate(opts):
+                    opt_combined = ((opt.text or "") + " " + (opt.get_attribute("value") or "")).lower()
+                    if forward_email.lower() in opt_combined:
+                        Select(sel_el).select_by_index(idx)
+                        try:
+                            driver.execute_script(
+                                "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));", sel_el
+                            )
+                        except Exception:
+                            pass
+                        selected_target_email = True
+                        logger.info(f"Đã chọn địa chỉ forwarding '{forward_email}' trong dropdown")
+                        break
+                if selected_target_email:
                     break
-            if selected_target_email:
-                break
-    except Exception:
-        pass
+
+            # Fallback khi tài khoản chỉ có 1 địa chỉ đã xác minh (Gmail ẩn <select>, hiển thị qua banner / innerHTML / input)
+            if not selected_target_email and forward_email.lower() in _get_forwarding_select_emails(driver):
+                selected_target_email = True
+                logger.info(f"Xác nhận địa chỉ forwarding '{forward_email}' đã được xác minh trên trang cài đặt Gmail")
+
+            # Fallback Gmail Workspace (sau khi xác minh vf-, hàng radio hiển thị ô <input type='text'> trống để nhập địa chỉ đích)
+            if not selected_target_email and allow_fill_inline_input:
+                inline_inp = _find_inline_forwarding_input(row_tr)
+                if inline_inp is not None and _fill_inline_forwarding_input(driver, inline_inp, forward_email):
+                    selected_target_email = True
+                    filled_inline_input = True
+        except BrowserClosedError:
+            raise
+        except Exception:
+            pass
+
+        if selected_target_email:
+            break
+        if force_reload and retry_idx == 0:
+            logger.info(f"Chưa thấy '{forward_email}' sau lần tải đầu -> Refresh lại trang cài đặt Gmail...")
+            time.sleep(2.5)
+            _reload_gmail_fwd_settings(driver)
 
     if not selected_target_email:
-        logger.warning(f"Chưa thấy '{forward_email}' trong danh sách địa chỉ chuyển tiếp đã xác minh trên Gmail")
+        logger.warning(
+            f"Chưa thấy '{forward_email}' trong danh sách địa chỉ chuyển tiếp đã xác minh trên Gmail "
+            f"(radio_row='{row_text_debug}')"
+        )
         return False
 
     was_selected = bool(enable_radio.is_selected() or enable_radio.get_attribute("checked"))
@@ -1307,6 +2182,16 @@ def _enable_and_save_gmail_forwarding(driver: WebDriver, forward_email: str, for
             logger.info("✅ Đã bấm 'Lưu thay đổi' / 'Save Changes' lưu cài đặt Gmail Forwarding thành công!")
         else:
             logger.info("ℹ️ Nút 'Lưu thay đổi' đang mờ (cài đặt Forwarding tới địa chỉ này đã được lưu sẵn)")
+
+    if filled_inline_input:
+        verified_after_save = forward_email.lower() in _get_forwarding_select_emails(driver)
+        if not verified_after_save:
+            time.sleep(2.0)
+            _reload_gmail_fwd_settings(driver)
+            verified_after_save = forward_email.lower() in _get_forwarding_select_emails(driver)
+        if not verified_after_save:
+            logger.warning(f"Sau khi lưu ô inline nhưng Gmail chưa ghi nhận chuyển tiếp tới '{forward_email}'")
+            return False
     return True
 
 
@@ -1372,19 +2257,45 @@ def setup_gmail_forwarding(
         time.sleep(1.5)
         _dismiss_gmail_popups(driver)
 
+        # Nếu hàng 'Chuyển tiếp bản sao của thư đến tới' đã có sẵn email @nguyenmaucole.io.vn (hoặc target_dom) -> dùng luôn & lưu cột H
+        match_domains = (target_dom,) if target_dom == TEMPMAIL_DOMAIN else (target_dom, TEMPMAIL_DOMAIN)
+        existing_row_email = _find_existing_forwarding_row_email(
+            driver, match_domains, exclude_email=gmail_email
+        )
+        if existing_row_email:
+            logger.info(
+                f"ℹ️ Đã tồn tại email chuyển tiếp '{existing_row_email}' ở hàng 'Chuyển tiếp bản sao của thư đến tới' -> Sử dụng luôn!"
+            )
+            if _enable_and_save_gmail_forwarding(
+                driver,
+                existing_row_email,
+                force_reload=False,
+                allow_fill_inline_input=True,
+            ):
+                return existing_row_email
+
         # Kiểm tra xem forward_email đã có trong dropdown địa chỉ đã xác minh chưa
         verified_emails = _get_forwarding_select_emails(driver)
         if forward_email.lower() in verified_emails:
             logger.info(f"ℹ️ Địa chỉ {forward_email} đã có trong danh sách đã xác minh -> Kiểm tra bật chuyển tiếp & lưu...")
-            if _enable_and_save_gmail_forwarding(driver, forward_email, force_reload=False):
+            if _enable_and_save_gmail_forwarding(
+                driver, forward_email, force_reload=False, allow_fill_inline_input=True
+            ):
                 return forward_email
 
-        # Kiểm tra xem địa chỉ đã được thêm trước đó và đang chờ nhập OTP (verifyText) chưa
+        # Kiểm tra xem địa chỉ đã được thêm trước đó và đang chờ xác minh (nhập OTP hoặc chờ bấm link 'Gửi lại email') chưa
         driver.implicitly_wait(0)
         needs_code_verify_only = False
         try:
             page_txt = (driver.execute_script("return document.body ? document.body.innerText : '';") or "").lower()
-            if forward_email.lower() in page_txt and _find_fwd_verify_code_input(driver) is not None:
+            has_pending_resend = any(
+                e.is_displayed()
+                for e in driver.find_elements(
+                    By.XPATH,
+                    "//*[@act='resend'] | //*[self::span or self::a or self::button][normalize-space()='Gửi lại email' or normalize-space()='Re-send email']",
+                )
+            )
+            if forward_email.lower() in page_txt and (_find_fwd_verify_code_input(driver) is not None or has_pending_resend):
                 needs_code_verify_only = True
         except Exception:
             pass
@@ -1414,6 +2325,11 @@ def setup_gmail_forwarding(
                         condition="clickable",
                     )
                 if not add_btn:
+                    # Một số tài khoản Workspace không có nút 'Add a forwarding address' mà hiển thị sẵn ô <input type='text'> inline
+                    if _enable_and_save_gmail_forwarding(
+                        driver, forward_email, force_reload=False, allow_fill_inline_input=True
+                    ):
+                        return forward_email
                     logger.error("Không tìm thấy nút 'Thêm địa chỉ chuyển tiếp' / 'Add a forwarding address'")
                     return ""
 
@@ -1452,22 +2368,25 @@ def setup_gmail_forwarding(
             _handle_gmail_forwarding_popups(driver, main_handle, handles_before, gmail_password, twofa_secret)
         else:
             # Địa chỉ đang chờ xác nhận -> bấm 'Gửi lại email' / 'Re-send email' ([act='resend']) nếu có
-            logger.info(f"Địa chỉ {forward_email} đang ở trạng thái chờ nhập OTP -> Gửi lại mã xác nhận...")
+            logger.info(f"Địa chỉ {forward_email} đang ở trạng thái chờ xác nhận -> Gửi lại mã/link xác nhận...")
             try:
                 resend_els = [
                     e for e in driver.find_elements(
                         By.XPATH,
-                        "//*[@act='resend'] | //span[contains(., 'Re-send') or contains(., 'Gửi lại')]",
+                        "//*[@act='resend'] | //*[self::span or self::a or self::button][normalize-space()='Gửi lại email' or normalize-space()='Re-send email']",
                     )
                     if e.is_displayed()
                 ]
                 if resend_els:
+                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", resend_els[0])
+                    time.sleep(0.3)
                     if not safe_click(resend_els[0], delay=2.0):
                         driver.execute_script("arguments[0].click();", resend_els[0])
                         time.sleep(2.0)
+                    logger.info("Đã bấm 'Gửi lại email' / 'Re-send email' xác nhận Gmail Forwarding")
                     _click_gmail_dialog_button(driver, ("ok", "đã hiểu"), name_attrs=("ok",))
-            except Exception:
-                pass
+            except Exception as e_rs:
+                logger.debug(f"Lỗi khi bấm Gửi lại email xác nhận: {e_rs}")
 
         # Lấy OTP / mã xác nhận & link xác nhận từ <prefix>@nguyenmaucole.io.vn (hoặc @fviainboxes.com)
         conf_code, vf_link = _fetch_gmail_forwarding_confirmation(driver, forward_email, seen_ids, timeout=120)
@@ -1512,8 +2431,7 @@ def setup_gmail_forwarding(
                 # Kiểm tra lại trong danh sách đã xác minh sau khi nhập OTP
                 time.sleep(2.0)
                 if forward_email.lower() not in _get_forwarding_select_emails(driver):
-                    _safe_get(driver, GMAIL_FWD_SETTINGS_URL)
-                    _wait_for_fwd_settings_ready(driver, timeout=12)
+                    _reload_gmail_fwd_settings(driver)
                     if forward_email.lower() not in _get_forwarding_select_emails(driver):
                         confirmed = False
 
@@ -1536,15 +2454,92 @@ def setup_gmail_forwarding(
                     if b.is_displayed()
                 ]
                 if confirm_btns:
-                    if not safe_click(confirm_btns[0], delay=3.0):
-                        driver.execute_script("arguments[0].click();", confirm_btns[0])
-                        time.sleep(3.0)
-                    logger.info("✅ Đã bấm 'Confirm' / 'Xác nhận' trên trang xác nhận link Gmail Forwarding!")
-                    confirmed = True
+                    cbtn = confirm_btns[0]
+                    logger.info(
+                        f"Tìm thấy nút xác nhận vf- ({cbtn.tag_name}, value={cbtn.get_attribute('value')!r}, "
+                        f"text={(cbtn.text or '').strip()!r}, url={driver.current_url[:75]})"
+                    )
+                    if not safe_click(cbtn, delay=2.0):
+                        driver.execute_script("arguments[0].click();", cbtn)
+                        time.sleep(2.0)
+
+                    # Nếu vẫn còn nút Confirm/Xác nhận trên form -> thử JS click + form.submit()
+                    def _poll_vf_status(max_loops: int = 8) -> Tuple[str, bool]:
+                        txt = ""
+                        done_ok = False
+                        for _ in range(max_loops):
+                            try:
+                                txt = (driver.execute_script("return document.body ? document.body.innerText : '';") or "").strip()
+                            except Exception:
+                                txt = ""
+                            low = unicodedata.normalize("NFC", txt).lower()
+                            still_form = any(
+                                b.is_displayed()
+                                for b in driver.find_elements(
+                                    By.XPATH,
+                                    "//input[@type='submit' and (@value='Confirm' or @value='Xác nhận')]"
+                                    " | //button[normalize-space()='Confirm' or normalize-space()='Xác nhận']",
+                                )
+                            )
+                            if any(
+                                k in low
+                                for k in (
+                                    "may now forward",
+                                    "confirmation success",
+                                    "xác nhận thành công",
+                                    "đã xác nhận",
+                                    "giờ có thể chuyển tiếp",
+                                    "bây giờ có thể chuyển tiếp",
+                                    "success!",
+                                )
+                            ):
+                                done_ok = True
+                                break
+                            if not still_form and txt and "vui lòng xác nhận" not in low and "please confirm" not in low:
+                                done_ok = True
+                                break
+                            time.sleep(0.6)
+                        return txt, done_ok
+
+                    vf_done_text, vf_ok = _poll_vf_status(8)
+                    if not vf_ok:
+                        logger.warning(
+                            f"Nút/form vf- chưa chuyển sau click đầu -> Thử submit lại form... "
+                            f"(url={driver.current_url[:75]}, text={vf_done_text[:120].replace(chr(10), ' ')!r})"
+                        )
+                        try:
+                            rem = [
+                                b for b in driver.find_elements(
+                                    By.XPATH,
+                                    "//input[@type='submit'] | //button[@type='submit' or normalize-space()='Confirm' or normalize-space()='Xác nhận']",
+                                )
+                                if b.is_displayed()
+                            ]
+                            if rem:
+                                driver.execute_script(
+                                    "if (arguments[0].form) { arguments[0].form.submit(); } else { arguments[0].click(); }",
+                                    rem[0],
+                                )
+                                time.sleep(2.5)
+                                vf_done_text, vf_ok = _poll_vf_status(8)
+                        except Exception as e_sub:
+                            logger.debug(f"Lỗi khi submit lại form vf-: {e_sub}")
+
+                    logger.info(
+                        f"Kết quả trang vf- (url={driver.current_url[:75]}, ok={vf_ok}): "
+                        f"{vf_done_text[:180].replace(chr(10), ' ')}"
+                    )
+                    if vf_ok:
+                        confirmed = True
                 else:
                     # Một số trường hợp trang vf-... tự xác nhận ngay khi mở
-                    b_vf = (driver.execute_script("return document.body ? document.body.innerText : '';") or "").lower()
-                    if any(k in b_vf for k in ("may now forward", "confirmation success", "xác nhận thành công", "đã xác nhận", "giờ có thể chuyển tiếp")):
+                    b_vf = (driver.execute_script("return document.body ? document.body.innerText : '';") or "").strip()
+                    logger.info(
+                        f"Trang vf- không có nút Confirm (url={driver.current_url[:75]}): "
+                        f"{b_vf[:180].replace(chr(10), ' ')}"
+                    )
+                    b_vf_low = unicodedata.normalize("NFC", b_vf).lower()
+                    if any(k in b_vf_low for k in ("may now forward", "confirmation success", "xác nhận thành công", "đã xác nhận", "giờ có thể chuyển tiếp", "bây giờ có thể chuyển tiếp", "success!")):
                         logger.info("✅ Trang link Gmail Forwarding đã xác nhận thành công!")
                         confirmed = True
             except Exception as e:
@@ -1561,8 +2556,10 @@ def setup_gmail_forwarding(
             logger.error("Không thể xác minh OTP hoặc link Gmail Forwarding")
             return ""
 
-        # Bước cuối: Chọn forward_email trong dropdown, tích 'Chuyển tiếp bản sao...' và bấm 'Lưu thay đổi'
-        if _enable_and_save_gmail_forwarding(driver, forward_email, force_reload=True):
+        # Bước cuối: Chọn forward_email trong dropdown (hoặc điền ô inline Workspace), tích 'Chuyển tiếp bản sao...' và bấm 'Lưu thay đổi'
+        if _enable_and_save_gmail_forwarding(
+            driver, forward_email, force_reload=True, allow_fill_inline_input=True
+        ):
             return forward_email
 
         return ""

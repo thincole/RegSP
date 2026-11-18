@@ -311,6 +311,18 @@ class AutoLoginApp:
         self.entry_gmail_shopee_pass.insert(0, getattr(config, 'NEW_SHOPEE_PASSWORD', 'Khoa01@c'))
         self.entry_gmail_shopee_pass.pack(side=tk.LEFT, padx=(8, 0))
 
+        # HupSMS API thuê SIM VN trong Tab Reg Gmail
+        gm_sms_frame = ttk.Frame(tab_gmail)
+        gm_sms_frame.pack(fill=tk.X, anchor=tk.W, pady=(6, 2))
+        ttk.Label(gm_sms_frame, text="HupSMS API Key:").pack(side=tk.LEFT)
+        self.entry_hupsms_api_key = ttk.Entry(gm_sms_frame, width=32)
+        self.entry_hupsms_api_key.insert(0, getattr(config, 'HUPSMS_API_KEY', ''))
+        self.entry_hupsms_api_key.pack(side=tk.LEFT, padx=(8, 12))
+        ttk.Label(gm_sms_frame, text="Service ID (0=Auto):").pack(side=tk.LEFT)
+        self.entry_hupsms_service_id = ttk.Entry(gm_sms_frame, width=7)
+        self.entry_hupsms_service_id.insert(0, str(getattr(config, 'HUPSMS_SERVICE_ID', 0) or 0))
+        self.entry_hupsms_service_id.pack(side=tk.LEFT, padx=(6, 0))
+
         row_idx = 6
 
         # Buttons
@@ -360,8 +372,14 @@ class AutoLoginApp:
                 (self.entry_hotmail_pass, "hotmail_pass"),
                 (self.entry_shopee_pass, "shopee_pass"),
                 (self.entry_gmail_shopee_pass, "gmail_shopee_pass"),
+                (self.entry_hupsms_api_key, "hupsms_api_key"),
+                (self.entry_hupsms_service_id, "hupsms_service_id"),
             ]:
-                if key in settings:
+                if key in settings and (
+                    key != "hupsms_api_key"
+                    or str(settings[key]).strip()
+                    or not getattr(config, "HUPSMS_API_KEY", "")
+                ):
                     entry.delete(0, tk.END)
                     entry.insert(0, str(settings[key]))
 
@@ -458,6 +476,8 @@ class AutoLoginApp:
             "gmail_cb_4": self.gmail_cb_vars[4].get(),
             "gmail_forwarding_domain": self.gmail_forwarding_domain_var.get(),
             "gmail_shopee_market": self.gmail_shopee_region_var.get(),
+            "hupsms_api_key": self.entry_hupsms_api_key.get().strip(),
+            "hupsms_service_id": self.entry_hupsms_service_id.get().strip(),
         }
         try:
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
@@ -535,6 +555,8 @@ class AutoLoginApp:
                 'NEW_SHOPEE_PASSWORD': self.entry_gmail_shopee_pass.get(),
                 'SHOPEE_REGION': self.gmail_shopee_region_var.get(),
                 'GMAIL_FORWARDING_DOMAIN': self.gmail_forwarding_domain_var.get(),
+                'HUPSMS_API_KEY': self.entry_hupsms_api_key.get().strip(),
+                'HUPSMS_SERVICE_ID': self.entry_hupsms_service_id.get().strip(),
             }
 
         return {

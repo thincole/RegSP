@@ -44,6 +44,7 @@ def _col_letter_to_index(col_letter: str) -> int:
 def read_via_service_account(
     sheet_url: str, sheet_name: str, service_account_file: str,
     start_row: int, end_row: int, col_data: str, col_profile: str,
+    col_forward_email: Optional[str] = None,
 ) -> List[Dict]:
     """Đọc Google Sheets qua Service Account (gspread)."""
     try:
@@ -64,6 +65,7 @@ def read_via_service_account(
 
         col_data_idx = _col_letter_to_index(col_data)
         col_profile_idx = _col_letter_to_index(col_profile)
+        col_fwd_idx = _col_letter_to_index(col_forward_email) if col_forward_email else None
 
         rows = []
         actual_end = end_row if end_row > 0 else len(all_values)
@@ -72,6 +74,11 @@ def read_via_service_account(
             row = all_values[i]
             raw_data = row[col_data_idx] if col_data_idx < len(row) else ""
             profile_name = row[col_profile_idx] if col_profile_idx < len(row) else ""
+            forward_email = (
+                row[col_fwd_idx].strip()
+                if col_fwd_idx is not None and col_fwd_idx < len(row) and row[col_fwd_idx]
+                else ""
+            )
 
             if raw_data:
                 pname = profile_name.strip() if profile_name else ""
@@ -79,6 +86,7 @@ def read_via_service_account(
                     "row_index": i + 1,
                     "raw_data": raw_data,
                     "profile_name": pname,
+                    "forward_email": forward_email,
                 })
 
         logger.info(f"Đọc được {len(rows)} dòng hợp lệ (hàng {start_row} đến {actual_end})")
@@ -93,6 +101,7 @@ def read_via_service_account(
 def read_via_public_csv(
     sheet_url: str, start_row: int, end_row: int,
     col_data: str, col_profile: str,
+    col_forward_email: Optional[str] = None,
 ) -> List[Dict]:
     """Đọc Google Sheets qua URL công khai (CSV export)."""
     sheet_id = _extract_sheet_id(sheet_url)
@@ -112,6 +121,8 @@ def read_via_public_csv(
         col_data_idx = _col_letter_to_index(col_data)
         col_profile_idx = _col_letter_to_index(col_profile)
 
+        col_fwd_idx = _col_letter_to_index(col_forward_email) if col_forward_email else None
+
         rows = []
         actual_end = end_row if end_row > 0 else len(all_rows)
 
@@ -119,6 +130,11 @@ def read_via_public_csv(
             row = all_rows[i]
             raw_data = row[col_data_idx] if col_data_idx < len(row) else ""
             profile_name = row[col_profile_idx] if col_profile_idx < len(row) else ""
+            forward_email = (
+                row[col_fwd_idx].strip()
+                if col_fwd_idx is not None and col_fwd_idx < len(row) and row[col_fwd_idx]
+                else ""
+            )
 
             if raw_data:
                 pname = profile_name.strip() if profile_name else ""
@@ -126,6 +142,7 @@ def read_via_public_csv(
                     "row_index": i + 1,
                     "raw_data": raw_data,
                     "profile_name": pname,
+                    "forward_email": forward_email,
                 })
 
         logger.info(f"Đọc được {len(rows)} dòng hợp lệ (hàng {start_row} đến {actual_end})")
@@ -139,24 +156,27 @@ def read_sheet_data(
     sheet_url: str, sheet_name: str, start_row: int, end_row: int,
     col_data: str, col_profile: str,
     service_account_file: Optional[str] = None,
+    col_forward_email: Optional[str] = None,
 ) -> List[Dict]:
     """
     Hàm chính đọc dữ liệu từ Google Sheets.
     Ưu tiên Service Account, fallback sang Public CSV.
 
     Returns:
-        List[{row_index, raw_data, profile_name}]
+        List[{row_index, raw_data, profile_name, forward_email}]
     """
     if service_account_file and os.path.exists(service_account_file):
         logger.info("Sử dụng Google Service Account")
         return read_via_service_account(
             sheet_url, sheet_name, service_account_file,
             start_row, end_row, col_data, col_profile,
+            col_forward_email=col_forward_email,
         )
 
     logger.info("Không tìm thấy Service Account, dùng Public CSV")
     return read_via_public_csv(
         sheet_url, start_row, end_row, col_data, col_profile,
+        col_forward_email=col_forward_email,
     )
 
 

@@ -13,6 +13,7 @@ Cấu trúc Cột B (phân cách bởi '|'):
   [7] MS Token
   [8] UUID
 """
+import re
 from typing import Dict, Optional
 
 import config
@@ -219,6 +220,11 @@ def validate_parsed_data(data: Dict, steps: list) -> bool:
     return True
 
 
+def _looks_like_email(value: str) -> bool:
+    """Kiểm tra chuỗi có dạng địa chỉ email hợp lệ (phân biệt với mật khẩu chứa ký tự '@')."""
+    return bool(re.match(r"^[^@\s]+@[^@\s]+\.[a-zA-Z]{2,}$", (value or "").strip()))
+
+
 def parse_gmail_column_b(raw_string: str) -> Dict[str, Optional[str]]:
     """
     Phân tích chuỗi Cột B cho Tab 'Reg Gmail'.
@@ -236,7 +242,7 @@ def parse_gmail_column_b(raw_string: str) -> Dict[str, Optional[str]]:
 
     email_idx = -1
     for i, part in enumerate(parts):
-        if "@" in part and "." in part.split("@")[-1]:
+        if _looks_like_email(part):
             gmail_email = part
             email_idx = i
             break
@@ -246,13 +252,17 @@ def parse_gmail_column_b(raw_string: str) -> Dict[str, Optional[str]]:
             f"Không tìm thấy địa chỉ Gmail hợp lệ trong Cột B: {raw_string[:80]}"
         )
 
-    if email_idx + 1 < len(parts) and "@" not in parts[email_idx + 1]:
-        gmail_password = parts[email_idx + 1]
+    skip_pwd_idx = -1
+    if email_idx + 1 < len(parts):
+        next_part = parts[email_idx + 1]
+        if next_part and not _looks_like_email(next_part):
+            gmail_password = next_part
+            skip_pwd_idx = email_idx + 1
 
     for i, part in enumerate(parts):
-        if i in (email_idx, email_idx + 1) or not part:
+        if i in (email_idx, skip_pwd_idx) or not part:
             continue
-        if "@" in part and "." in part.split("@")[-1] and part.lower() != gmail_email.lower():
+        if _looks_like_email(part) and part.lower() != gmail_email.lower():
             if not recovery_email:
                 recovery_email = part
         else:

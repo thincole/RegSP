@@ -11,7 +11,13 @@ from modules.data_parser import (
     parse_gmail_column_b,
     validate_gmail_parsed_data,
 )
-from modules.gemlogin_manager import find_profile_by_name, start_profile, stop_profile, connect_selenium
+from modules.gemlogin_manager import (
+    ensure_gemlogin_running,
+    find_profile_by_name,
+    start_profile,
+    stop_profile,
+    connect_selenium,
+)
 from modules.facebook_login import login_facebook
 from modules.gmail_login import login_gmail, setup_gmail_forwarding
 from modules.hotmail_login import (
@@ -246,6 +252,8 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
                 logger.error(f"Dòng {row_index} ({profile_name}): Login Hotmail thất bại.")
 
         # Bước 4: Thêm Email forwarding (@nguyenmaucole.io.vn hoặc @fviainboxes.com)
+        sheet_fwd = (row.get('forward_email') or '').strip()
+        fwd_email = sheet_fwd if '@' in sheet_fwd else ''
         if 4 in selected_steps and not stop_flag.is_set():
             check_browser_alive(driver)
             if 3 in selected_steps and not hot_ok:
@@ -253,7 +261,7 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
             else:
                 logger.info(f"Dòng {row_index} ({profile_name}): Bắt đầu Bước 4 - Thêm Email forwarding về @{fwd_target_domain}")
                 try:
-                    fwd_email = setup_hotmail_forwarding(
+                    res_fwd = setup_hotmail_forwarding(
                         driver,
                         parsed['hotmail_email'],
                         recovery_email,
@@ -267,14 +275,15 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
                     if is_browser_closed_exception(e):
                         raise BrowserClosedError(str(e)) from e
                     logger.error(f"Dòng {row_index} ({profile_name}): Thêm forwarding mail lỗi - {e}")
-                    fwd_email = ""
+                    res_fwd = ""
 
-                if fwd_email:
+                if res_fwd:
                     fwd_str = (
-                        fwd_email
-                        if isinstance(fwd_email, str)
+                        res_fwd
+                        if isinstance(res_fwd, str)
                         else f"{parsed['hotmail_email'].split('@')[0].strip().lower()}@{fwd_target_domain}"
                     )
+                    fwd_email = fwd_str
                     col_h = getattr(config, 'COL_FORWARD_EMAIL', 'H')
                     write_cell(sheet_url, sheet_name, row_index, col_h, fwd_str, sa_file)
                     logger.info(
@@ -297,6 +306,7 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
                     region,
                     parsed.get('hotmail_email', ''),
                     fwd_target_domain,
+                    forward_email=fwd_email,
                 )
                 if isinstance(res, tuple):
                     aff_ok, aff_username, aff_id = res
@@ -316,21 +326,26 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
                 check_browser_alive(driver)
                 logger.error(f"Dòng {row_index} ({profile_name}): Reg Aff Shopee {region} thất bại. Đánh dấu '{shopee_err_msg}'.")
                 write_cell(sheet_url, sheet_name, row_index, config.COL_STATUS, shopee_err_msg, sa_file)
-                return
+                if 6 in selected_steps and shopee_err_msg != "Lỗi đăng ký SP Mobile" and not stop_flag.is_set():
+                    logger.info(
+                        f"Dòng {row_index} ({profile_name}): Bỏ qua ghi AFF -> Vẫn tiếp tục Bước 6 (Đổi Pass Shopee)."
+                    )
+                else:
+                    return
+            else:
+                result_cols = getattr(config, 'SHOPEE_RESULT_COLS', {}).get(
+                    region,
+                    (getattr(config, 'COL_USERNAME', 'F'), getattr(config, 'COL_AFFILIATE_ID', 'G')),
+                )
+                col_u, col_a = result_cols
+                if aff_username:
+                    write_cell(sheet_url, sheet_name, row_index, col_u, aff_username, sa_file)
+                    logger.info(f"Dòng {row_index} ({profile_name}): Đã ghi Username {region} ('{aff_username}') vào cột {col_u}.")
+                if aff_id:
+                    write_cell(sheet_url, sheet_name, row_index, col_a, aff_id, sa_file)
+                    logger.info(f"Dòng {row_index} ({profile_name}): Đã ghi Affiliate ID {region} ('{aff_id}') vào cột {col_a}.")
 
-            result_cols = getattr(config, 'SHOPEE_RESULT_COLS', {}).get(
-                region,
-                (getattr(config, 'COL_USERNAME', 'F'), getattr(config, 'COL_AFFILIATE_ID', 'G')),
-            )
-            col_u, col_a = result_cols
-            if aff_username:
-                write_cell(sheet_url, sheet_name, row_index, col_u, aff_username, sa_file)
-                logger.info(f"Dòng {row_index} ({profile_name}): Đã ghi Username {region} ('{aff_username}') vào cột {col_u}.")
-            if aff_id:
-                write_cell(sheet_url, sheet_name, row_index, col_a, aff_id, sa_file)
-                logger.info(f"Dòng {row_index} ({profile_name}): Đã ghi Affiliate ID {region} ('{aff_id}') vào cột {col_a}.")
-
-            logger.info(f"Dòng {row_index} ({profile_name}): Reg Aff Shopee {region} thành công.")
+                logger.info(f"Dòng {row_index} ({profile_name}): Reg Aff Shopee {region} thành công.")
 
         # Bước 6: Đổi Pass Shopee
         if 6 in selected_steps and not stop_flag.is_set():
@@ -343,6 +358,7 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
                     new_shopee_pass,
                     parsed.get('hotmail_email', ''),
                     fwd_target_domain,
+                    forward_email=fwd_email,
                 )
             except BrowserClosedError:
                 raise
@@ -451,6 +467,21 @@ def _process_single_row_gmail(row, gui_config, selected_steps, stop_flag):
         gmail_password = parsed.get('gmail_password', '')
         recovery_email = parsed.get('recovery_email', '')
         twofa_secret = parsed.get('gmail_2fa_secret', '')
+        hupsms_api_key = str(gui_config.get('HUPSMS_API_KEY') or getattr(config, 'HUPSMS_API_KEY', '') or '').strip()
+        try:
+            hupsms_service_id = int(
+                str(
+                    gui_config.get('HUPSMS_SERVICE_ID')
+                    if gui_config.get('HUPSMS_SERVICE_ID') not in (None, '')
+                    else getattr(config, 'HUPSMS_SERVICE_ID', 0)
+                ).strip()
+                or 0
+            )
+        except ValueError:
+            hupsms_service_id = 0
+
+        sheet_fwd_email = (row.get('forward_email') or '').strip()
+        fwd_email = sheet_fwd_email if '@' in sheet_fwd_email else ''
 
         # Bước 1: Login Gmail + Thêm Forwarding mail về @nguyenmaucole.io.vn (hoặc @fviainboxes.com)
         if 1 in selected_steps and not stop_flag.is_set():
@@ -459,7 +490,15 @@ def _process_single_row_gmail(row, gui_config, selected_steps, stop_flag):
                 f"Dòng {row_index} ({profile_name}): Bắt đầu Bước 1 - Login Gmail & Thêm Forwarding về @{fwd_target_domain}"
             )
             try:
-                gm_ok = login_gmail(driver, gmail_email, gmail_password, recovery_email, twofa_secret)
+                gm_ok = login_gmail(
+                    driver,
+                    gmail_email,
+                    gmail_password,
+                    recovery_email,
+                    twofa_secret,
+                    hupsms_api_key=hupsms_api_key,
+                    hupsms_service_id=hupsms_service_id,
+                )
             except BrowserClosedError:
                 raise
             except LoginFailedError as e:
@@ -476,7 +515,7 @@ def _process_single_row_gmail(row, gui_config, selected_steps, stop_flag):
 
             logger.info(f"Dòng {row_index} ({profile_name}): Login Gmail thành công -> Cài đặt Forwarding về @{fwd_target_domain}...")
             try:
-                fwd_email = setup_gmail_forwarding(
+                detected_fwd = setup_gmail_forwarding(
                     driver,
                     gmail_email,
                     gmail_password,
@@ -490,16 +529,24 @@ def _process_single_row_gmail(row, gui_config, selected_steps, stop_flag):
                 if is_browser_closed_exception(e):
                     raise BrowserClosedError(str(e)) from e
                 logger.error(f"Dòng {row_index} ({profile_name}): Cài đặt Gmail Forwarding lỗi - {e}")
-                fwd_email = ""
+                detected_fwd = ""
 
-            if fwd_email:
+            if detected_fwd:
+                fwd_email = detected_fwd.strip()
                 col_h = getattr(config, 'COL_FORWARD_EMAIL', 'H')
                 write_cell(sheet_url, sheet_name, row_index, col_h, fwd_email, sa_file)
                 logger.info(
                     f"Dòng {row_index} ({profile_name}): Cài đặt Gmail Forwarding thành công ({fwd_email}) -> Đã ghi vào cột {col_h}."
                 )
             else:
-                logger.error(f"Dòng {row_index} ({profile_name}): Cài đặt Gmail Forwarding thất bại.")
+                check_browser_alive(driver)
+                logger.error(
+                    f"Dòng {row_index} ({profile_name}): Cài đặt Gmail Forwarding thất bại -> Dừng lại, không chuyển sang bước tiếp theo."
+                )
+                write_cell(sheet_url, sheet_name, row_index, config.COL_STATUS, 'Lỗi Gmail Forwarding', sa_file)
+                return
+        elif fwd_email:
+            logger.info(f"Dòng {row_index} ({profile_name}): Dùng email Forwarding sẵn ở Cột H: {fwd_email}")
 
         # Bước 2: Login Shopee bằng Gmail (PH / MY / ID)
         if 2 in selected_steps and not stop_flag.is_set():
@@ -552,6 +599,7 @@ def _process_single_row_gmail(row, gui_config, selected_steps, stop_flag):
                     gmail_password=gmail_password,
                     recovery_email=recovery_email,
                     twofa_secret=twofa_secret,
+                    forward_email=fwd_email,
                 )
                 if isinstance(res, tuple):
                     aff_ok, aff_username, aff_id = res
@@ -571,21 +619,26 @@ def _process_single_row_gmail(row, gui_config, selected_steps, stop_flag):
                 check_browser_alive(driver)
                 logger.error(f"Dòng {row_index} ({profile_name}): Reg AFF Shopee {region} thất bại. Đánh dấu '{shopee_err_msg}'.")
                 write_cell(sheet_url, sheet_name, row_index, config.COL_STATUS, shopee_err_msg, sa_file)
-                return
+                if 4 in selected_steps and shopee_err_msg != "Lỗi đăng ký SP Mobile" and not stop_flag.is_set():
+                    logger.info(
+                        f"Dòng {row_index} ({profile_name}): Reg AFF thất bại -> Vẫn tiếp tục Bước 4 (Đổi Pass Shopee)."
+                    )
+                else:
+                    return
+            else:
+                result_cols = getattr(config, 'SHOPEE_RESULT_COLS', {}).get(
+                    region,
+                    (getattr(config, 'COL_USERNAME', 'F'), getattr(config, 'COL_AFFILIATE_ID', 'G')),
+                )
+                col_u, col_a = result_cols
+                if aff_username:
+                    write_cell(sheet_url, sheet_name, row_index, col_u, aff_username, sa_file)
+                    logger.info(f"Dòng {row_index} ({profile_name}): Đã ghi Username {region} ('{aff_username}') vào cột {col_u}.")
+                if aff_id:
+                    write_cell(sheet_url, sheet_name, row_index, col_a, aff_id, sa_file)
+                    logger.info(f"Dòng {row_index} ({profile_name}): Đã ghi Affiliate ID {region} ('{aff_id}') vào cột {col_a}.")
 
-            result_cols = getattr(config, 'SHOPEE_RESULT_COLS', {}).get(
-                region,
-                (getattr(config, 'COL_USERNAME', 'F'), getattr(config, 'COL_AFFILIATE_ID', 'G')),
-            )
-            col_u, col_a = result_cols
-            if aff_username:
-                write_cell(sheet_url, sheet_name, row_index, col_u, aff_username, sa_file)
-                logger.info(f"Dòng {row_index} ({profile_name}): Đã ghi Username {region} ('{aff_username}') vào cột {col_u}.")
-            if aff_id:
-                write_cell(sheet_url, sheet_name, row_index, col_a, aff_id, sa_file)
-                logger.info(f"Dòng {row_index} ({profile_name}): Đã ghi Affiliate ID {region} ('{aff_id}') vào cột {col_a}.")
-
-            logger.info(f"Dòng {row_index} ({profile_name}): Reg AFF Shopee {region} thành công.")
+                logger.info(f"Dòng {row_index} ({profile_name}): Reg AFF Shopee {region} thành công.")
 
         # Bước 4: Change Pass Shopee
         if 4 in selected_steps and not stop_flag.is_set():
@@ -598,6 +651,7 @@ def _process_single_row_gmail(row, gui_config, selected_steps, stop_flag):
                     new_shopee_pass,
                     gmail_email,
                     fwd_target_domain,
+                    forward_email=fwd_email,
                 )
             except BrowserClosedError:
                 raise
@@ -660,6 +714,7 @@ def process_all_rows(gui_config, selected_steps, stop_flag, progress_callback, l
             col_data=config.COL_DATA,
             col_profile=config.COL_PROFILE,
             service_account_file=sa_file,
+            col_forward_email=getattr(config, 'COL_FORWARD_EMAIL', 'H'),
         )
     except Exception as e:
         logger.error(f"Lỗi đọc Google Sheet: {e}")
@@ -668,6 +723,10 @@ def process_all_rows(gui_config, selected_steps, stop_flag, progress_callback, l
     total_rows = len(rows_data)
     if total_rows == 0:
         logger.warning("Không có dữ liệu để xử lý.")
+        return
+
+    if not ensure_gemlogin_running(stop_flag=stop_flag):
+        logger.error("GemLogin chưa bật và không thể tự động khởi động. Đã dừng tiến trình.")
         return
 
     completed_count = 0

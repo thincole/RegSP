@@ -13,6 +13,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import time
 import zipfile
 import threading
@@ -34,7 +35,188 @@ logger = get_logger()
 # API base URL
 API_BASE = f"http://127.0.0.1:{config.GEMLOGIN_API_PORT}"
 _start_profile_lock = threading.Lock()
+_ensure_gemlogin_lock = threading.Lock()
 _profile_paths: Dict[str, str] = {}
+
+
+def is_gemlogin_api_ready(timeout: float = 2.0) -> bool:
+    """Kiểm tra GemLogin Local API đã sẵn sàng phản hồi (DeviceValid/profiles OK) chưa."""
+    try:
+        resp = requests.get(f"{API_BASE}/api/profiles?per_page=1", timeout=timeout)
+        if resp.status_code == 200:
+            data = resp.json()
+            return isinstance(data, dict) and data.get("success") is True
+    except Exception:
+        pass
+    return False
+
+
+def _is_gemlogin_process_running() -> bool:
+    """Kiểm tra tiến trình GemLogin.exe đang chạy hay chưa (Windows)."""
+    if os.name != "nt":
+        return False
+    try:
+        res = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq GemLogin.exe", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=0x08000000,
+        )
+        return "gemlogin.exe" in (res.stdout or "").lower()
+    except Exception:
+        return False
+
+
+def _find_gemlogin_executable() -> Optional[str]:
+    """Tự động tìm file GemLogin.exe qua config, đường dẫn cài đặt phổ biến và shortcut (.lnk)."""
+    cfg_path = getattr(config, "GEMLOGIN_EXE_PATH", "")
+    candidates = []
+    if cfg_path:
+        candidates.append(cfg_path)
+
+    for env_key, rel_parts in (
+        ("ProgramFiles", ("GemLogin", "GemLogin.exe")),
+        ("ProgramFiles(x86)", ("GemLogin", "GemLogin.exe")),
+        ("LOCALAPPDATA", ("Programs", "GemLogin", "GemLogin.exe")),
+        ("LOCALAPPDATA", ("Programs", "gemlogin", "GemLogin.exe")),
+    ):
+        base = os.environ.get(env_key, "")
+        if base:
+            candidates.append(os.path.join(base, *rel_parts))
+
+    candidates.extend([
+        r"C:\Program Files\GemLogin\GemLogin.exe",
+        r"D:\GemLogin\GemLogin.exe",
+        r"E:\GemLogin\GemLogin.exe",
+    ])
+
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+
+    if os.name == "nt":
+        shortcut_dirs = [
+            os.path.join(os.environ.get("PUBLIC", r"C:\Users\Public"), "Desktop"),
+            os.path.join(os.environ.get("USERPROFILE", ""), "Desktop"),
+            os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs"),
+            os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "Microsoft", "Windows", "Start Menu", "Programs"),
+        ]
+        lnk_files = []
+        for sdir in shortcut_dirs:
+            if not sdir or not os.path.isdir(sdir):
+                continue
+            for root, _dirs, files in os.walk(sdir):
+                for fn in files:
+                    if "gemlogin" in fn.lower() and fn.lower().endswith(".lnk"):
+                        lnk_files.append(os.path.join(root, fn))
+
+        for lnk in lnk_files:
+            try:
+                ps_cmd = (
+                    "$sh = New-Object -ComObject WScript.Shell; "
+                    f"$s = $sh.CreateShortcut('{lnk.replace(chr(39), chr(39)*2)}'); "
+                    "Write-Output $s.TargetPath"
+                )
+                res = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", ps_cmd],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    creationflags=0x08000000,
+                )
+                target = (res.stdout or "").strip().splitlines()
+                target_path = target[-1].strip() if target else ""
+                if target_path and os.path.isfile(target_path):
+                    return target_path
+            except Exception:
+                pass
+
+    return None
+
+
+def _launch_detached_gemlogin(exe_path: str) -> None:
+    """
+    Khởi chạy GemLogin hoàn toàn tách biệt (ngoài Job Object / process tree của tool)
+    để khi tắt tool thì GemLogin không bị tắt theo.
+    """
+    work_dir = os.path.dirname(exe_path) or None
+    if os.name == "nt":
+        detached = 0x00000008  # DETACHED_PROCESS
+        new_group = 0x00000200  # CREATE_NEW_PROCESS_GROUP
+        breakaway = 0x01000000  # CREATE_BREAKAWAY_FROM_JOB
+        try:
+            subprocess.Popen(
+                ["explorer.exe", os.path.normpath(exe_path)],
+                creationflags=detached | new_group,
+                close_fds=True,
+            )
+            return
+        except Exception as e:
+            logger.debug(f"explorer.exe khởi chạy GemLogin lỗi ({e}), thử Popen tách Job...")
+
+        for flags in (breakaway | detached | new_group, detached | new_group):
+            try:
+                subprocess.Popen(
+                    [exe_path],
+                    cwd=work_dir,
+                    creationflags=flags,
+                    close_fds=True,
+                )
+                return
+            except OSError:
+                continue
+        os.startfile(exe_path)
+    else:
+        subprocess.Popen(
+            [exe_path],
+            cwd=work_dir,
+            start_new_session=True,
+            close_fds=True,
+        )
+
+
+def ensure_gemlogin_running(wait_timeout: int = 60, stop_flag=None) -> bool:
+    """
+    Kiểm tra GemLogin đã bật chưa; nếu chưa bật thì tự động khởi động GemLogin.exe
+    và chờ Local API (127.0.0.1:1010) sẵn sàng.
+    """
+    if is_gemlogin_api_ready(timeout=2.0):
+        logger.debug("GemLogin API đã đang chạy sẵn.")
+        return True
+
+    with _ensure_gemlogin_lock:
+        if is_gemlogin_api_ready(timeout=2.0):
+            return True
+
+        logger.info("GemLogin chưa bật (API không phản hồi) -> Đang kiểm tra & tự khởi động GemLogin...")
+        if _is_gemlogin_process_running():
+            logger.info("Phát hiện tiến trình GemLogin.exe đang khởi chạy -> Chờ API sẵn sàng...")
+        else:
+            exe_path = _find_gemlogin_executable()
+            if not exe_path:
+                logger.error("Không tìm thấy GemLogin.exe để tự động bật! Vui lòng mở GemLogin thủ công.")
+                return False
+
+            logger.info(f"Đang tự động bật GemLogin: {exe_path}")
+            try:
+                _launch_detached_gemlogin(exe_path)
+            except Exception as e:
+                logger.error(f"Không thể khởi động GemLogin ({exe_path}): {e}")
+                return False
+
+        deadline = time.time() + max(5, int(wait_timeout))
+        while time.time() < deadline:
+            if stop_flag is not None and stop_flag.is_set():
+                logger.warning("Đã dừng chờ khởi động GemLogin theo yêu cầu.")
+                return False
+            if is_gemlogin_api_ready(timeout=2.0):
+                logger.info("✅ GemLogin đã khởi động và API sẵn sàng!")
+                return True
+            time.sleep(1.5)
+
+        logger.error(f"Đã chờ {wait_timeout}s nhưng GemLogin API ({API_BASE}) vẫn chưa phản hồi.")
+        return False
 
 
 def _api_get(endpoint: str, timeout: int = 15) -> dict:
@@ -91,6 +273,9 @@ def find_profile_by_name(profile_name: str) -> str:
         ProfileNotFoundError nếu không tìm thấy.
     """
     logger.info(f"Đang tìm profile: '{profile_name}'")
+    if not is_gemlogin_api_ready(timeout=2.0):
+        if not ensure_gemlogin_running():
+            raise ProfileNotFoundError("GemLogin chưa sẵn sàng và không thể tự động khởi động.")
     candidates = _get_candidate_profile_names(profile_name)
 
     try:
@@ -206,76 +391,44 @@ def _disable_save_password_popup(profile_id: str) -> None:
         logger.debug(f"Không thể cập nhật Preferences cho profile {profile_id}: {e}")
 
 
-_gemcaptcha_initialized = False
+_gemcaptcha_cleaned = False
 
 
-def _ensure_gemcaptcha_extension() -> str:
+def _cleanup_gemcaptcha_extension() -> None:
     """
-    Đảm bảo extension GemCaptcha (trong thư mục extensions/gemcaptcha) đã được điền sẵn API Key
-    và tự động đăng ký vào ~/.gemlogin/extensions/extension.json để Gemlogin nạp tự động cho mọi profile.
-    Trả về đường dẫn tuyệt đối tới thư mục extension (nếu tồn tại).
+    Gỡ bỏ extension GemCaptcha (nếu từng được đăng ký trước đó) khỏi
+    ~/.gemlogin/extensions/extension.json để tránh xung đột/chặn anti-bot.
     """
-    global _gemcaptcha_initialized
-    ext_dir = getattr(
-        config,
-        "GEMCAPTCHA_EXTENSION_DIR",
-        os.path.join(config.APP_DIR, "extensions", "gemcaptcha"),
-    )
-    ext_dir = os.path.normpath(ext_dir)
-    if not os.path.isdir(ext_dir):
-        return ""
+    global _gemcaptcha_cleaned
+    if _gemcaptcha_cleaned:
+        return
 
-    if _gemcaptcha_initialized:
-        return ext_dir
-
-    api_key = getattr(config, "GEMCAPTCHA_API_KEY", "").strip()
     try:
-        # 1. Cập nhật configs.json của extension với API key hiện tại
-        cfg_file = os.path.join(ext_dir, "configs.json")
-        if os.path.isfile(cfg_file) and api_key:
-            with open(cfg_file, "r", encoding="utf-8") as f:
-                cfg_data = json.load(f)
-            if cfg_data.get("api_key") != api_key or not cfg_data.get("power_on"):
-                cfg_data["api_key"] = api_key
-                cfg_data["power_on"] = True
-                with open(cfg_file, "w", encoding="utf-8") as f:
-                    json.dump(cfg_data, f, indent=2, ensure_ascii=False)
-
-        # 2. Đăng ký vào ~/.gemlogin/extensions/extension.json để Gemlogin nạp tự động
         gem_ext_json = os.path.join(os.path.expanduser("~"), ".gemlogin", "extensions", "extension.json")
         if os.path.isfile(gem_ext_json):
             with open(gem_ext_json, "r", encoding="utf-8") as f:
                 ext_list = json.load(f)
             if isinstance(ext_list, list):
-                found = False
-                for item in ext_list:
-                    if isinstance(item, dict) and (
-                        item.get("id") == "gemcaptcha_auto_solve"
-                        or "gemcaptcha" in (item.get("name") or "").lower()
-                        or "gemcaptcha" in (item.get("path") or "").lower()
-                    ):
-                        item["path"] = ext_dir
-                        item["disabled"] = False
-                        found = True
-                if not found:
-                    ext_list.append(
-                        {
-                            "id": "gemcaptcha_auto_solve",
-                            "name": "GEMcaptcha: Auto solve captcha",
-                            "path": ext_dir,
-                            "description": "GEMcaptcha: Auto solve captcha",
-                            "disabled": False,
-                            "deletable": True,
-                        }
+                filtered = [
+                    item
+                    for item in ext_list
+                    if not (
+                        isinstance(item, dict)
+                        and (
+                            item.get("id") == "gemcaptcha_auto_solve"
+                            or "gemcaptcha" in (item.get("id") or "").lower()
+                            or "gemcaptcha" in (item.get("name") or "").lower()
+                            or "gemcaptcha" in (item.get("path") or "").lower()
+                        )
                     )
-                with open(gem_ext_json, "w", encoding="utf-8") as f:
-                    json.dump(ext_list, f, ensure_ascii=False)
-                logger.info(f"✅ Đã tích hợp extension GemCaptcha vào Gemlogin: {ext_dir}")
-        _gemcaptcha_initialized = True
+                ]
+                if len(filtered) != len(ext_list):
+                    with open(gem_ext_json, "w", encoding="utf-8") as f:
+                        json.dump(filtered, f, ensure_ascii=False)
+                    logger.info("Đã gỡ extension GemCaptcha khỏi cấu hình Gemlogin")
+        _gemcaptcha_cleaned = True
     except Exception as e:
-        logger.debug(f"Lỗi khi cấu hình extension GemCaptcha: {e}")
-
-    return ext_dir
+        logger.debug(f"Lỗi khi dọn extension GemCaptcha: {e}")
 
 
 @retry(max_retries=2, delay=3.0, exceptions=(ProfileStartError,))
@@ -296,11 +449,10 @@ def start_profile(profile_id: str) -> Dict:
     try:
         with _start_profile_lock:
             _disable_save_password_popup(profile_id)
-            ext_dir = _ensure_gemcaptcha_extension()
-            extra_args = "--disable-save-password-bubble"
-            if ext_dir:
-                ext_forward = ext_dir.replace("\\", "/")
-                extra_args += f" --load-extension={ext_forward}"
+            _cleanup_gemcaptcha_extension()
+            # Truyền đơn lẻ --disable-extensions vì Gemlogin bỏ qua addination_args nếu có khoảng trắng;
+            # popup Save Password đã được tắt trực tiếp qua Default/Preferences trong _disable_save_password_popup().
+            extra_args = "--disable-extensions"
             res = _api_get(
                 f"/api/profiles/start/{profile_id}?addination_args={urllib.parse.quote(extra_args)}",
                 timeout=30,

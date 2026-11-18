@@ -10,7 +10,7 @@ import json
 import html
 import urllib.request
 import urllib.parse
-from typing import Tuple
+from typing import List, Optional, Tuple
 
 import requests
 from selenium.common.exceptions import TimeoutException
@@ -70,7 +70,7 @@ def _is_shopee_phone_verification(driver: WebDriver) -> bool:
 
 def _wait_for_captcha(driver: WebDriver, timeout: int = None) -> bool:
     """
-    Phát hiện captcha Shopee và chờ extension GemCaptcha tự động giải (hoặc người dùng giải bằng tay).
+    Phát hiện captcha Shopee và chờ người dùng giải bằng tay trên trình duyệt.
     Captcha có text 'Verify to Continue', 'slide to complete the puzzle',
     hoặc URL chứa 'verify/captcha' / 'verify/traffic'.
     Nếu người dùng đóng trình duyệt hoặc xuất hiện 'Mobile Phone Verification' thì thoát ngay lập tức.
@@ -85,67 +85,101 @@ def _wait_for_captcha(driver: WebDriver, timeout: int = None) -> bool:
         logger.warning("⚠️ Phát hiện màn hình 'Mobile Phone Verification' trên Shopee -> Bỏ qua luồng này!")
         raise LoginFailedError("Shopee yêu cầu xác minh SĐT (Mobile Phone Verification)")
 
-    def _is_captcha_present() -> Tuple[bool, str]:
+    def _is_hard_blocked(txt_low: str, cur_url: str, has_slider_dom: bool) -> bool:
+        if "verify/traffic" in cur_url and not has_slider_dom:
+            return True
+        if (
+            "please try again later" in txt_low
+            or "verification can't be completed" in txt_low
+        ):
+            return True
+        return False
+
+    def _collect_page_text_lower() -> str:
+        js = """
+            const parts = [];
+            if (document.body && document.body.innerText) {
+                parts.push(document.body.innerText);
+            }
+            const walkShadows = (root) => {
+                if (!root || !root.querySelectorAll) return;
+                for (const el of root.querySelectorAll('*')) {
+                    if (el.shadowRoot) {
+                        parts.push(el.shadowRoot.textContent || '');
+                        walkShadows(el.shadowRoot);
+                    }
+                }
+            };
+            walkShadows(document);
+            for (const f of document.querySelectorAll('iframe')) {
+                try {
+                    const doc = f.contentDocument || (f.contentWindow && f.contentWindow.document);
+                    if (doc && doc.body && doc.body.innerText) {
+                        parts.push(doc.body.innerText);
+                    }
+                } catch (e) {}
+            }
+            return parts.join('\\n');
+        """
+        return (driver.execute_script(js) or "").lower()
+
+    def _is_captcha_present() -> Tuple[bool, str, bool]:
         check_browser_alive(driver)
         if _is_shopee_phone_verification(driver):
             logger.warning("⚠️ Phát hiện màn hình 'Mobile Phone Verification' trên Shopee -> Bỏ qua luồng này!")
             raise LoginFailedError("Shopee yêu cầu xác minh SĐT (Mobile Phone Verification)")
         try:
             cur_url = (driver.current_url or "").lower()
-            if "verify/captcha" in cur_url or "verify/traffic" in cur_url:
-                return True, f"URL={cur_url[:60]}"
-            txt = (driver.execute_script("return document.body ? document.body.innerText : '';") or "").lower()
-            for kw in ("verify to continue", "slide to complete", "please slide", "please try again later"):
-                if kw in txt:
-                    return True, kw
-            has_dom_captcha = driver.execute_script(
+            txt = _collect_page_text_lower()
+            has_dom_captcha = bool(driver.execute_script(
                 "return Boolean(document.querySelector('[id*=\"captchaMask\"], [id*=\"puzzleContainer\"], [id*=\"NEW_CAPTCHA\"]'));"
-            )
+            ))
+            if _is_hard_blocked(txt, cur_url, has_dom_captcha):
+                return True, "Please Try Again Later / verify/traffic", True
+            if "verify/captcha" in cur_url or "verify/traffic" in cur_url:
+                return True, f"URL={cur_url[:60]}", False
+            for kw in ("verify to continue", "slide to complete", "please slide"):
+                if kw in txt:
+                    return True, kw, False
             if has_dom_captcha:
-                return True, "DOM=captchaMask/puzzleContainer"
+                return True, "DOM=captchaMask/puzzleContainer", False
         except (BrowserClosedError, LoginFailedError):
             raise
         except Exception as e:
             if is_browser_closed_exception(e):
                 raise BrowserClosedError(f"Trình duyệt đã bị đóng: {e}") from e
-        return False, ""
+        return False, "", False
 
     driver.implicitly_wait(0)
     try:
-        captcha_found, matched_reason = _is_captcha_present()
+        captcha_found, matched_reason, is_hard_block = _is_captcha_present()
         if not captcha_found:
             return True
+        if is_hard_block:
+            logger.warning(
+                f"⚠️ Shopee đang báo chặn ({matched_reason}) không có ô kéo captcha -> Không thể tự động giải."
+            )
+            return False
 
-        logger.warning(f"⚠️ CAPTCHA Shopee phát hiện! ({matched_reason}) -> Đang chờ GemCaptcha tự động giải...")
+        logger.warning(f"⚠️ CAPTCHA Shopee phát hiện! ({matched_reason}) -> Vui lòng giải Captcha trên trình duyệt...")
 
         start_time = time.time()
         alerted_manual = False
-        last_gem_msg = ""
 
         while time.time() - start_time < timeout:
             elapsed = int(time.time() - start_time)
-            # Trong 30s đầu quét nhanh 2s/lần để đợi extension GemCaptcha tự kéo giải
+            # Trong 30s đầu quét nhanh 2s/lần để nhận biết ngay khi captcha qua
             poll_sleep = 2 if elapsed < 30 else check_interval
             time.sleep(poll_sleep)
 
-            still_visible, reason = _is_captcha_present()
+            still_visible, reason, still_hard_block = _is_captcha_present()
             if not still_visible:
                 logger.info("✅ Captcha Shopee đã được giải thành công! Tiếp tục sang bước tiếp theo...")
                 time.sleep(1)
                 return True
-
-            try:
-                gem_msg = (
-                    driver.execute_script(
-                        "const el = document.getElementById('captcha-message'); return el ? el.innerText : '';"
-                    )
-                    or ""
-                ).strip()
-                if gem_msg and gem_msg != last_gem_msg:
-                    last_gem_msg = gem_msg
-                    logger.info(f"🤖 {gem_msg}")
-            except Exception:
-                gem_msg = ""
+            if still_hard_block:
+                logger.warning(f"⚠️ Shopee chuyển sang màn hình chặn ({reason}) -> Dừng chờ captcha.")
+                return False
 
             elapsed = int(time.time() - start_time)
             if elapsed >= 30 and not alerted_manual:
@@ -166,8 +200,7 @@ def _wait_for_captcha(driver: WebDriver, timeout: int = None) -> bool:
                 except Exception:
                     pass
 
-            if elapsed >= 30 or not gem_msg:
-                logger.info(f"⏳ Đang chờ giải captcha... ({elapsed}s / {timeout}s) [{reason}]")
+            logger.info(f"⏳ Đang chờ giải captcha... ({elapsed}s / {timeout}s) [{reason}]")
 
         logger.error(f"⏰ Hết thời gian chờ captcha ({timeout}s)")
         return False
@@ -980,6 +1013,55 @@ def _handle_google_popup(
     return True
 
 
+def _extract_shopee_confirm_link(body_html: str) -> str:
+    """Trích xuất link xác nhận (Verify by Email Link) của Shopee từ HTML email (gồm cả link bọc qua SendGrid)."""
+    if not body_html:
+        return ""
+
+    raw_links = re.findall(r'href=["\'](https?://[^"\']+)["\']', body_html, flags=re.IGNORECASE)
+    for raw_link in raw_links:
+        link = html.unescape(raw_link).strip()
+        low = link.lower()
+        if "shp.ee/dlink" in low or "verify/email-link" in low or "dlink" in low:
+            return link
+
+    confirm_anchor_texts = {
+        "here", "click here", "confirm", "verify", "confirm now", "verify now",
+        "di sini", "sini", "klik di sini", "konfirmasi", "sahkan",
+        "tại đây", "đây", "bấm vào đây", "xác nhận",
+    }
+    anchor_re = re.compile(
+        r'<a\b[^>]*href=["\'](https?://[^"\']+)["\'][^>]*>(.*?)</a>',
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for m in anchor_re.finditer(body_html):
+        link = html.unescape(m.group(1)).strip()
+        low = link.lower()
+        if any(
+            bad in low
+            for bad in (
+                "help.shopee", "universal-link", "privacy", "terms",
+                "facebook.com", "instagram.com", "twitter.com", "tiktok.com", "youtube.com",
+            )
+        ):
+            continue
+        anchor_txt = re.sub(
+            r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", m.group(2)))
+        ).strip().lower()
+        if not anchor_txt or any(bad in anchor_txt for bad in ("privacy", "terms", "help", "support", "http")):
+            continue
+        if anchor_txt in confirm_anchor_texts:
+            ctx_raw = body_html[max(0, m.start() - 220):min(len(body_html), m.end() + 220)]
+            ctx_txt = html.unescape(re.sub(r"<[^>]+>", " ", ctx_raw)).lower()
+            if (
+                any(k in ctx_txt for k in ("confirm", "verify", "click", "password", "xác nhận", "mật khẩu", "konfirmasi", "sahkan", "kata sandi"))
+                or "sendgrid.net/ls/click" in low
+                or "shopee" in low
+            ):
+                return link
+    return ""
+
+
 def _get_existing_tempmail_ids(tempmail_address: str) -> set:
     """Lấy danh sách ID các email hiện có trên cả nguyenmaucole.io.vn và fviainboxes.com để tránh đọc lại code/link cũ."""
     addr = (tempmail_address or "").strip().lower()
@@ -1022,7 +1104,53 @@ def _get_existing_tempmail_ids(tempmail_address: str) -> set:
     return seen
 
 
-def _check_nmc_for_shopee_otp(prefix: str, seen_ids: set) -> str:
+def _resolve_tempmail_address(
+    forward_email: str = "",
+    fallback_email: str = "",
+    forwarding_domain: str = "nguyenmaucole.io.vn",
+) -> str:
+    """Ưu tiên email Forwarding đầy đủ (từ Cột H / Gmail Forwarding); fallback về <prefix>@<forwarding_domain>."""
+    fwd = (forward_email or "").strip().lower()
+    if fwd and "@" in fwd:
+        return fwd
+    prefix = (fallback_email or "").split("@")[0].strip().lower()
+    dom = (forwarding_domain or "nguyenmaucole.io.vn").strip().lstrip("@").lower()
+    return f"{prefix}@{dom}" if prefix else ""
+
+
+def _nmc_sender_matches_expected(
+    sender: str,
+    body_html: str,
+    expected_account_emails: Optional[List[str]] = None,
+) -> Optional[bool]:
+    """
+    Kiểm tra email forward qua Gmail (+caf_=...) có khớp tài khoản đang xử lý không:
+      - True: khớp chính xác <prefix>+caf_= hoặc có email trong nội dung
+      - None: email gửi thẳng (không phải +caf_=) hoặc không truyền expected_account_emails
+      - False: có +caf_= nhưng thuộc prefix tài khoản khác (tránh luồng song song lấy nhầm OTP)
+    """
+    exp_emails = {e.strip().lower() for e in (expected_account_emails or []) if e and "@" in e}
+    exp_prefixes = {e.split("@", 1)[0] for e in exp_emails if e.split("@", 1)[0]}
+    if not exp_prefixes:
+        return None
+    s_low = (sender or "").strip().lower()
+    if "+caf_=" not in s_low:
+        return None
+    caf_prefix = s_low.split("+caf_=", 1)[0].strip().lower()
+    if caf_prefix in exp_prefixes:
+        return True
+    b_low = (body_html or "").lower()
+    if any(e in b_low for e in exp_emails):
+        return True
+    return False
+
+
+def _check_nmc_for_shopee_otp(
+    prefix: str,
+    seen_ids: set,
+    expected_account_emails: Optional[List[str]] = None,
+    allow_foreign_caf: bool = False,
+) -> str:
     """Kiểm tra hộp thư nguyenmaucole.io.vn tìm mã OTP 6 chữ số của Shopee."""
     nmc_addr = f"{prefix}@nguyenmaucole.io.vn"
     api_url = f"https://tempmail-backend.thincole.workers.dev/api/emails?address={nmc_addr}"
@@ -1031,6 +1159,7 @@ def _check_nmc_for_shopee_otp(prefix: str, seen_ids: set) -> str:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="ignore"))
         if isinstance(data, list):
+            foreign_fallback = ""
             for m in data:
                 if not isinstance(m, dict):
                     continue
@@ -1041,13 +1170,23 @@ def _check_nmc_for_shopee_otp(prefix: str, seen_ids: set) -> str:
                 sender = (m.get("sender") or "").lower()
                 if "shopee" in subj or "shopee" in sender or "verification" in subj or "kode" in subj:
                     body_html = m.get("body_html") or ""
+                    owner_match = _nmc_sender_matches_expected(sender, body_html, expected_account_emails)
+                    if owner_match is False and not allow_foreign_caf:
+                        continue
                     text = re.sub(r"<[^>]+>", " ", body_html)
                     text = re.sub(r"\s+", " ", text)
                     codes = re.findall(r"\b(\d{6})\b", text)
                     if codes:
+                        if owner_match is False:
+                            if not foreign_fallback:
+                                foreign_fallback = codes[0]
+                            continue
                         logger.info(f"✅ Đã lấy được mã OTP Shopee từ {nmc_addr}: {codes[0]}")
                         return codes[0]
                 seen_ids.add(f"nmc:{msg_id}")
+            if allow_foreign_caf and foreign_fallback:
+                logger.info(f"✅ Đã lấy được mã OTP Shopee từ {nmc_addr} (fallback): {foreign_fallback}")
+                return foreign_fallback
     except Exception as e:
         logger.debug(f"Lỗi gọi API nguyenmaucole.io.vn: {e}")
     return ""
@@ -1182,12 +1321,10 @@ def _fetch_fvia_browser_content(driver: WebDriver, prefix: str, fvia_dom: str, m
                             except Exception:
                                 driver.switch_to.default_content()
                         if mode == "link":
-                            links = re.findall(r'href=["\'](https?://[^"\']+)["\']', srcdoc)
-                            for raw_link in links:
-                                link = html.unescape(raw_link)
-                                if "shp.ee/dlink" in link or "verify/email-link" in link or "dlink" in link:
-                                    logger.info(f"✅ Đã lấy được link xác nhận Shopee từ UI fviainboxes.com: {link}")
-                                    return link
+                            link = _extract_shopee_confirm_link(srcdoc)
+                            if link:
+                                logger.info(f"✅ Đã lấy được link xác nhận Shopee từ UI fviainboxes.com: {link}")
+                                return link
                         else:
                             text_clean = re.sub(r"<[^>]+>", " ", srcdoc)
                             codes = re.findall(r"\b(\d{6})\b", text_clean)
@@ -1216,6 +1353,7 @@ def _fetch_shopee_email_otp(
     tempmail_address: str,
     seen_ids: set = None,
     timeout: int = 180,
+    expected_account_emails: Optional[List[str]] = None,
 ) -> str:
     """
     Lấy mã OTP 6 chữ số của Shopee từ hộp thư chuyển tiếp (@nguyenmaucole.io.vn hoặc @fviainboxes.com).
@@ -1234,6 +1372,8 @@ def _fetch_shopee_email_otp(
 
     while time.time() - start_time < timeout:
         check_browser_alive(driver)
+        elapsed = int(time.time() - start_time)
+        allow_foreign_caf = elapsed >= 20
         if is_fvia_primary:
             if not fvia_blocked:
                 code, blocked = _check_fvia_for_shopee_otp(prefix, fvia_dom, seen_ids)
@@ -1246,11 +1386,21 @@ def _fetch_shopee_email_otp(
                         ui_code = _fetch_fvia_browser_content(driver, prefix, fvia_dom, mode="otp")
                         if ui_code:
                             return ui_code
-            code_alt = _check_nmc_for_shopee_otp(prefix, seen_ids)
+            code_alt = _check_nmc_for_shopee_otp(
+                prefix,
+                seen_ids,
+                expected_account_emails=expected_account_emails,
+                allow_foreign_caf=allow_foreign_caf,
+            )
             if code_alt:
                 return code_alt
         else:
-            code = _check_nmc_for_shopee_otp(prefix, seen_ids)
+            code = _check_nmc_for_shopee_otp(
+                prefix,
+                seen_ids,
+                expected_account_emails=expected_account_emails,
+                allow_foreign_caf=allow_foreign_caf,
+            )
             if code:
                 return code
             if not fvia_blocked:
@@ -1260,7 +1410,6 @@ def _fetch_shopee_email_otp(
                 if blocked:
                     fvia_blocked = True
 
-        elapsed = int(time.time() - start_time)
         if elapsed > 0 and elapsed % 9 == 0:
             logger.info(f"Đang chờ email OTP Shopee gửi về {addr}... ({elapsed}s/{timeout}s)")
         time.sleep(3)
@@ -1306,22 +1455,61 @@ def _fetch_shopee_email_otp(
 def _get_affiliate_account_setting(driver: WebDriver, affiliate_url: str) -> Tuple[str, str]:
     """
     Truy cập https://affiliate.shopee.ph/account_setting và lấy Username (Cột F) + Affiliate ID (Cột G).
+    Ưu tiên click điều hướng nội bộ trong SPA (nếu đang ở affiliate.shopee.*) trước khi dùng URL trực tiếp,
+    và dừng báo lỗi rõ ràng nếu Shopee chặn bằng màn hình /verify/captcha ('Please Try Again Later').
     """
     setting_url = f"{affiliate_url.rstrip('/')}/account_setting"
     logger.info(f"Truy cập trang Account Setting: {setting_url}")
     driver.implicitly_wait(0)
     try:
-        driver.get(setting_url)
-        time.sleep(3)
-        wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
+        # Ưu tiên click menu/link nội bộ trong trang affiliate.shopee.* nếu đã có sẵn để giảm nguy cơ reload kích hoạt verify/captcha
+        navigated_in_spa = False
+        cur_u = (driver.current_url or "").lower()
+        if "affiliate.shopee." in cur_u and "account_setting" not in cur_u:
+            try:
+                spa_links = [
+                    el for el in driver.find_elements(
+                        By.XPATH,
+                        "//a[contains(@href, 'account_setting')] | //*[self::a or self::li or self::div or self::span][normalize-space()='Account Setting' or normalize-space()='Account Settings']",
+                    )
+                    if el.is_displayed()
+                ]
+                if spa_links:
+                    if not safe_click(spa_links[0], delay=2.5):
+                        driver.execute_script("arguments[0].click();", spa_links[0])
+                        time.sleep(2.5)
+                    if "account_setting" in (driver.current_url or "").lower():
+                        navigated_in_spa = True
+                        logger.info("Đã điều hướng nội bộ tới Account Setting trong trang Affiliate.")
+            except Exception:
+                pass
+
+        if not navigated_in_spa and "account_setting" not in (driver.current_url or "").lower():
+            driver.get(setting_url)
+            time.sleep(3)
+            wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
+
+        # Kiểm tra nếu có slider captcha -> chờ người dùng xử lý; nếu bị chặn cứng 'Please Try Again Later' -> báo rõ lỗi
+        _wait_for_captcha(driver)
+        if _is_shopee_captcha_or_blocked(driver) or "verify/captcha" in (driver.current_url or "").lower():
+            logger.error(
+                "❌ Shopee chặn truy cập trang /account_setting bằng màn hình Verification / 'Please Try Again Later' "
+                f"(URL: {(driver.current_url or '')[:90]})"
+            )
+            raise LoginFailedError("Shopee chặn captcha 'Please Try Again Later' khi vào /account_setting")
 
         username = ""
         affiliate_id = ""
         for attempt in range(12):
             try:
+                if _is_shopee_captcha_or_blocked(driver) or "verify/captcha" in (driver.current_url or "").lower():
+                    logger.error("❌ Shopee chuyển hướng sang /verify/captcha khi đang đọc /account_setting!")
+                    raise LoginFailedError("Shopee chặn captcha 'Please Try Again Later' khi vào /account_setting")
+
                 if "account_setting" not in (driver.current_url or "").lower() and attempt == 4:
                     driver.get(setting_url)
                     time.sleep(3)
+                    _wait_for_captcha(driver)
 
                 if not username:
                     u_els = driver.find_elements(
@@ -1347,20 +1535,34 @@ def _get_affiliate_account_setting(driver: WebDriver, affiliate_url: str) -> Tup
 
                 if username and affiliate_id:
                     break
+            except (BrowserClosedError, LoginFailedError):
+                raise
             except Exception:
                 pass
             time.sleep(1.5)
 
         logger.info(f"✅ Account Setting -> Username: '{username}', Affiliate ID: '{affiliate_id}'")
         return username, affiliate_id
+    except (BrowserClosedError, LoginFailedError):
+        raise
     except Exception as e:
+        if is_browser_closed_exception(e):
+            raise BrowserClosedError(f"Trình duyệt đã bị đóng: {e}") from e
         logger.error(f"Lỗi khi lấy thông tin từ {setting_url}: {e}")
         return "", ""
     finally:
-        driver.implicitly_wait(5)
+        try:
+            driver.implicitly_wait(5)
+        except Exception:
+            pass
 
 
-def _check_nmc_for_shopee_link(prefix: str, seen_ids: set) -> str:
+def _check_nmc_for_shopee_link(
+    prefix: str,
+    seen_ids: set,
+    expected_account_emails: Optional[List[str]] = None,
+    allow_foreign_caf: bool = False,
+) -> str:
     """Kiểm tra hộp thư nguyenmaucole.io.vn tìm link xác nhận Shopee."""
     nmc_addr = f"{prefix}@nguyenmaucole.io.vn"
     api_url = f"https://tempmail-backend.thincole.workers.dev/api/emails?address={nmc_addr}"
@@ -1369,6 +1571,7 @@ def _check_nmc_for_shopee_link(prefix: str, seen_ids: set) -> str:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="ignore"))
         if isinstance(data, list):
+            foreign_fallback = ""
             for m in data:
                 if not isinstance(m, dict):
                     continue
@@ -1379,13 +1582,21 @@ def _check_nmc_for_shopee_link(prefix: str, seen_ids: set) -> str:
                 sender = (m.get("sender") or "").lower()
                 if "shopee" in subj or "shopee" in sender or "verification" in subj or "password" in subj or "verifikasi" in subj:
                     body_html = m.get("body_html") or ""
-                    links = re.findall(r'href=["\'](https?://[^"\']+)["\']', body_html)
-                    for raw_link in links:
-                        link = html.unescape(raw_link)
-                        if "shp.ee/dlink" in link or "verify/email-link" in link or "dlink" in link:
-                            logger.info(f"✅ Đã lấy được link xác nhận Shopee từ {nmc_addr}: {link}")
-                            return link
+                    owner_match = _nmc_sender_matches_expected(sender, body_html, expected_account_emails)
+                    if owner_match is False and not allow_foreign_caf:
+                        continue
+                    link = _extract_shopee_confirm_link(body_html)
+                    if link:
+                        if owner_match is False:
+                            if not foreign_fallback:
+                                foreign_fallback = link
+                            continue
+                        logger.info(f"✅ Đã lấy được link xác nhận Shopee từ {nmc_addr}: {link}")
+                        return link
                 seen_ids.add(f"nmc:{msg_id}")
+            if allow_foreign_caf and foreign_fallback:
+                logger.info(f"✅ Đã lấy được link xác nhận Shopee từ {nmc_addr} (fallback): {foreign_fallback}")
+                return foreign_fallback
     except Exception as e:
         logger.debug(f"Lỗi gọi API nguyenmaucole.io.vn tìm link: {e}")
     return ""
@@ -1432,12 +1643,10 @@ def _check_fvia_for_shopee_link(prefix: str, fvia_dom: str, seen_ids: set) -> Tu
                                 body_html = body_resp.text
                         except Exception:
                             body_html = body_resp.text
-                    links = re.findall(r'href=["\'](https?://[^"\']+)["\']', body_html)
-                    for raw_link in links:
-                        link = html.unescape(raw_link)
-                        if "shp.ee/dlink" in link or "verify/email-link" in link or "dlink" in link:
-                            logger.info(f"✅ Đã lấy được link xác nhận Shopee từ {full_addr}: {link}")
-                            return link, False
+                    link = _extract_shopee_confirm_link(body_html)
+                    if link:
+                        logger.info(f"✅ Đã lấy được link xác nhận Shopee từ {full_addr}: {link}")
+                        return link, False
                 seen_ids.add(f"fvia:{msg_id}")
     except Exception as e:
         logger.debug(f"Lỗi gọi API fviainboxes.com tìm link: {e}")
@@ -1449,6 +1658,7 @@ def _fetch_shopee_email_link(
     tempmail_address: str,
     seen_ids: set = None,
     timeout: int = 180,
+    expected_account_emails: Optional[List[str]] = None,
 ) -> str:
     """
     Lấy link xác nhận (Verify by Email Link) của Shopee từ @nguyenmaucole.io.vn hoặc @fviainboxes.com.
@@ -1467,6 +1677,8 @@ def _fetch_shopee_email_link(
 
     while time.time() - start_time < timeout:
         check_browser_alive(driver)
+        elapsed = int(time.time() - start_time)
+        allow_foreign_caf = elapsed >= 20
         if is_fvia_primary:
             if not fvia_blocked:
                 link, blocked = _check_fvia_for_shopee_link(prefix, fvia_dom, seen_ids)
@@ -1478,11 +1690,21 @@ def _fetch_shopee_email_link(
                         ui_link = _fetch_fvia_browser_content(driver, prefix, fvia_dom, mode="link")
                         if ui_link:
                             return ui_link
-            link_alt = _check_nmc_for_shopee_link(prefix, seen_ids)
+            link_alt = _check_nmc_for_shopee_link(
+                prefix,
+                seen_ids,
+                expected_account_emails=expected_account_emails,
+                allow_foreign_caf=allow_foreign_caf,
+            )
             if link_alt:
                 return link_alt
         else:
-            link = _check_nmc_for_shopee_link(prefix, seen_ids)
+            link = _check_nmc_for_shopee_link(
+                prefix,
+                seen_ids,
+                expected_account_emails=expected_account_emails,
+                allow_foreign_caf=allow_foreign_caf,
+            )
             if link:
                 return link
             if not fvia_blocked:
@@ -1492,7 +1714,6 @@ def _fetch_shopee_email_link(
                 if blocked:
                     fvia_blocked = True
 
-        elapsed = int(time.time() - start_time)
         if elapsed > 0 and elapsed % 9 == 0:
             logger.info(f"Đang chờ email chứa link xác nhận Shopee tại {addr}... ({elapsed}s/{timeout}s)")
         time.sleep(3)
@@ -1565,6 +1786,7 @@ def change_shopee_password(
     new_shopee_password: str,
     hotmail_email: str,
     forwarding_domain: str = "nguyenmaucole.io.vn",
+    forward_email: str = "",
 ) -> bool:
     """
     Bước 6: Đổi mật khẩu Shopee:
@@ -1590,9 +1812,10 @@ def change_shopee_password(
         _switch_to_shopee_tab(driver)
         _enable_shopee_antibot_bypass(driver)
 
-        email_prefix = (hotmail_email or "").split("@")[0].strip().lower()
-        fwd_dom = (forwarding_domain or "nguyenmaucole.io.vn").strip().lstrip("@").lower()
-        tempmail_address = f"{email_prefix}@{fwd_dom}" if email_prefix else ""
+        tempmail_address = _resolve_tempmail_address(forward_email, hotmail_email, forwarding_domain)
+        if forward_email and "@" in forward_email:
+            logger.info(f"Sử dụng Email Forwarding (Cột H) để lấy link đổi pass Shopee: {tempmail_address}")
+        expected_acc_emails = [hotmail_email] if hotmail_email else None
         seen_ids = _get_existing_tempmail_ids(tempmail_address) if tempmail_address else set()
 
         is_my_or_id = "shopee.com.my" in base_domain.lower() or "shopee.co.id" in base_domain.lower()
@@ -1608,7 +1831,16 @@ def change_shopee_password(
         wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
         if is_my_or_id:
             _select_shopee_english_language(driver)
-        _wait_for_captcha(driver)
+        cap_ok = _wait_for_captcha(driver)
+        if (
+            not cap_ok
+            or _is_shopee_captcha_or_blocked(driver)
+            or "verify/captcha" in (driver.current_url or "").lower()
+        ):
+            logger.error(
+                f"❌ Shopee chặn trang đổi mật khẩu bằng Verification / Captcha ({(driver.current_url or '')[:90]})"
+            )
+            return False
         if is_my_or_id:
             _select_shopee_english_language(driver)
 
@@ -1640,7 +1872,13 @@ def change_shopee_password(
                 pass
 
         if clicked_verify_link and tempmail_address:
-            confirm_link = _fetch_shopee_email_link(driver, tempmail_address, seen_ids=seen_ids, timeout=180)
+            confirm_link = _fetch_shopee_email_link(
+                driver,
+                tempmail_address,
+                seen_ids=seen_ids,
+                timeout=180,
+                expected_account_emails=expected_acc_emails,
+            )
             if confirm_link:
                 main_handle = driver.current_window_handle
                 try:
@@ -1691,7 +1929,11 @@ def change_shopee_password(
                 logger.error(f"Không lấy được link xác nhận Shopee từ {tempmail_address}")
                 return False
 
-        _wait_for_captcha(driver)
+        if not _wait_for_captcha(driver) or _is_shopee_captcha_or_blocked(driver) or "verify/captcha" in (driver.current_url or "").lower():
+            logger.error(
+                f"❌ Shopee chặn trang đặt mật khẩu mới ({(driver.current_url or '')[:90]})"
+            )
+            return False
         # Điền mật khẩu mới Shopee vào New Password & Confirm Password
         wait_for_element(
             driver, By.CSS_SELECTOR, "input[name='newPassword'], input[type='password']", timeout=12, condition="visible"
@@ -1756,6 +1998,7 @@ def _register_affiliate(
     gmail_password: str = "",
     recovery_email: str = "",
     twofa_secret: str = "",
+    forward_email: str = "",
 ) -> Tuple[str, str]:
     """
     Đăng ký Shopee Affiliate:
@@ -1864,6 +2107,12 @@ def _register_affiliate(
             logger.warning("⚠️ Phát hiện màn hình 'Mobile Phone Verification' trên Shopee -> Bỏ qua luồng này!")
             raise LoginFailedError("Shopee yêu cầu xác minh SĐT (Mobile Phone Verification)")
         _wait_for_captcha(driver)
+        if _is_shopee_captcha_or_blocked(driver) or "verify/captcha" in (driver.current_url or "").lower():
+            logger.error(
+                "❌ Shopee chặn trang Affiliate bằng Verification / 'Please Try Again Later' "
+                f"(URL: {(driver.current_url or '')[:90]})"
+            )
+            raise LoginFailedError("Shopee chặn captcha 'Please Try Again Later' trên trang Affiliate")
 
         # Kiểm tra nếu tài khoản đã đăng ký Affiliate rồi (ví dụ step=3 hoặc dashboard)
         body_text = ""
@@ -2163,9 +2412,10 @@ def _register_affiliate(
                 continue
 
         # 7. Xử lý popup "Select verification method" → chọn "Verify with Email" → click "Confirm"
-        email_prefix = (contact_email or hotmail_email).split("@")[0].strip().lower()
-        fwd_dom = (forwarding_domain or "nguyenmaucole.io.vn").strip().lstrip("@").lower()
-        tempmail_address = f"{email_prefix}@{fwd_dom}" if email_prefix else ""
+        tempmail_address = _resolve_tempmail_address(forward_email, contact_email or hotmail_email, forwarding_domain)
+        if forward_email and "@" in forward_email:
+            logger.info(f"Sử dụng Email Forwarding (Cột H) để lấy OTP Shopee Affiliate: {tempmail_address}")
+        expected_acc_emails = [e for e in (contact_email, hotmail_email) if e and "@" in e]
         seen_ids = _get_existing_tempmail_ids(tempmail_address) if tempmail_address else set()
 
         verify_email_selectors = [
@@ -2213,7 +2463,13 @@ def _register_affiliate(
             condition="visible",
         )
         if otp_inp and tempmail_address:
-            otp_code = _fetch_shopee_email_otp(driver, tempmail_address, seen_ids=seen_ids, timeout=180)
+            otp_code = _fetch_shopee_email_otp(
+                driver,
+                tempmail_address,
+                seen_ids=seen_ids,
+                timeout=180,
+                expected_account_emails=expected_acc_emails,
+            )
             if otp_code:
                 otp_inp.click()
                 otp_inp.clear()
@@ -2351,7 +2607,7 @@ def _is_shopee_captcha_or_blocked(driver: WebDriver) -> bool:
     """
     Kiểm tra xem trang Shopee hiện tại có đang ở màn hình chặn traffic ('verify/traffic')
     hoặc thông báo 'Please Try Again Later' / 'Verification can't be completed' hay không.
-    (Riêng 'verify/captcha' có hình kéo mảnh ghép sẽ để GemCaptcha tự động giải qua _wait_for_captcha).
+    (Riêng 'verify/captcha' có hình kéo mảnh ghép sẽ chờ người dùng xử lý qua _wait_for_captcha).
     """
     driver.implicitly_wait(0)
     try:
@@ -2477,7 +2733,7 @@ def login_shopee_account_via_facebook(
                 if _is_shopee_phone_verification(driver):
                     logger.warning("⚠️ Phát hiện màn hình 'Mobile Phone Verification' trên Shopee -> Bỏ qua luồng này!")
                     raise LoginFailedError("Shopee yêu cầu xác minh SĐT (Mobile Phone Verification)")
-                # Nếu sau khi bấm nút Facebook mà Shopee bật Captcha kéo hình trước khi mở popup FB -> chờ GemCaptcha giải
+                # Nếu sau khi bấm nút Facebook mà Shopee bật Captcha kéo hình trước khi mở popup FB -> chờ giải captcha
                 if not (set(driver.window_handles) - handles_before_click):
                     _wait_for_captcha(driver)
                     if not (set(driver.window_handles) - handles_before_click) and "buyer/login" in (driver.current_url or "").lower():
@@ -2803,6 +3059,7 @@ def register_shopee_affiliate(
     gmail_password: str = "",
     recovery_email: str = "",
     twofa_secret: str = "",
+    forward_email: str = "",
 ) -> Tuple[bool, str, str]:
     """
     Đăng ký Shopee Affiliate theo thị trường đã chọn ở Bước 2 (hỗ trợ cả Tab Reg Clone & Tab Reg Gmail).
@@ -2838,6 +3095,7 @@ def register_shopee_affiliate(
             gmail_password=gmail_password,
             recovery_email=recovery_email,
             twofa_secret=twofa_secret,
+            forward_email=forward_email,
         )
         if username or affiliate_id:
             return True, username, affiliate_id
@@ -2861,6 +3119,7 @@ def login_shopee_via_facebook(
     new_shopee_password: str = "",
     hotmail_email: str = "",
     forwarding_domain: str = "nguyenmaucole.io.vn",
+    forward_email: str = "",
 ) -> Tuple[bool, str, str]:
     """
     Hàm tương thích gộp cả Login Shopee bằng Facebook + Đăng ký Shopee Affiliate.
@@ -2868,4 +3127,12 @@ def login_shopee_via_facebook(
     ok = login_shopee_account_via_facebook(driver, fb_uid, fb_password, shopee_url, region_name)
     if not ok:
         return False, "", ""
-    return register_shopee_affiliate(driver, fb_uid, fb_password, region_name, hotmail_email, forwarding_domain)
+    return register_shopee_affiliate(
+        driver,
+        fb_uid,
+        fb_password,
+        region_name,
+        hotmail_email,
+        forwarding_domain,
+        forward_email=forward_email,
+    )

@@ -57,15 +57,10 @@ MS_TOKEN_INDEX = 7            # Microsoft Token
 UUID_INDEX = 8                # UUID
 
 # ============================================================
-# GEMLOGIN & GEMCAPTCHA API
+# GEMLOGIN API
 # ============================================================
 GEMLOGIN_API_PORT = int(os.getenv("GEMLOGIN_API_PORT", "1010"))
 GEMLOGIN_API_BASE = f"http://localhost:{GEMLOGIN_API_PORT}/api/v3"
-GEMCAPTCHA_API_KEY = os.getenv(
-    "GEMCAPTCHA_API_KEY",
-    "GEM_IIXATPHUNM8DESMJV53GWNVQYEDAQ0M0X0TNK9KGPKDEGM1HNJKHZI83AFNUKG1778167636",
-)
-GEMCAPTCHA_EXTENSION_DIR = os.path.join(APP_DIR, "extensions", "gemcaptcha")
 
 # ============================================================
 # TIMING & THREADS (giây)
@@ -108,6 +103,16 @@ SHOPEE_AFFILIATE_URLS = {
 # ============================================================
 NEW_HOTMAIL_PASSWORD = os.getenv("NEW_HOTMAIL_PASSWORD", "Khoa01@@c")
 NEW_SHOPEE_PASSWORD = os.getenv("NEW_SHOPEE_PASSWORD", "Khoa01@c")
+
+# ============================================================
+# HupSMS API (Thuê SIM VN xác minh SĐT Gmail)
+# ============================================================
+HUPSMS_API_KEY = os.getenv("HUPSMS_API_KEY", "").strip()
+HUPSMS_SERVICE_ID = int(os.getenv("HUPSMS_SERVICE_ID", "0") or 0)
+HUPSMS_NETWORK = os.getenv("HUPSMS_NETWORK", "").strip()
+HUPSMS_PREFIX = os.getenv("HUPSMS_PREFIX", "").strip()
+HUPSMS_SMS_TIMEOUT = int(os.getenv("HUPSMS_SMS_TIMEOUT", "180") or 180)
+HUPSMS_MAX_RETRIES = int(os.getenv("HUPSMS_MAX_RETRIES", "2") or 2)
 
 # ============================================================
 # LOGGING & VERSION
