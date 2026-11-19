@@ -641,9 +641,9 @@ def solve_shopee_captcha(
     dx_css = dx_img / scale
     dy_css = dy_img / scale
 
-    if dx_css < 3.0:
-        return False, f"toạ độ đích không hợp lệ (dx={dx_css:.1f}px, mode={mode})"
-    if dx_css > bg["w"]:
+    if abs(dx_css) < 3.0 and abs(dy_css) < 3.0:
+        return False, f"toạ độ đích không hợp lệ (dx={dx_css:.1f}, dy={dy_css:.1f}, mode={mode})"
+    if abs(dx_css) > bg["w"]:
         logger.warning(
             f"⚠️ OMOCaptcha: quãng kéo {dx_css:.1f}px vượt bề rộng ảnh nền {bg['w']:.0f}px, vẫn thử."
         )

@@ -2089,7 +2089,7 @@ def _register_affiliate(
     """
     Đăng ký Shopee Affiliate:
     1. Truy cập trang affiliate
-    2. (Nếu skip_social_link=False) Click "+ Add" Facebook → xử lý popup FB OAuth → điền link FB → click Confirm
+    2. (Nếu skip_social_link=False và không phải Shopee.PH) Click "+ Add" Facebook → xử lý popup FB OAuth → điền link FB → click Confirm
     3. Điền số điện thoại → click "Verify & Submit"
     4. Chọn "Verify with Email" → click "Confirm"
     5. Lấy mã OTP từ <prefix>@<forwarding_domain> → điền mã → click "Next"
@@ -2217,7 +2217,13 @@ def _register_affiliate(
             logger.info("Tài khoản đã hoàn tất đăng ký Affiliate trước đó! Chuyển sang lấy Account Setting...")
             return _get_affiliate_account_setting(driver, affiliate_url)
 
-        if not skip_social_link:
+        is_shopee_ph = (
+            (region_name or "").strip().lower() in ("shopee.ph", "shopee ph")
+            or "affiliate.shopee.ph" in (affiliate_url or "").lower()
+        )
+        effective_skip_social = skip_social_link or is_shopee_ph
+
+        if not effective_skip_social:
             # Lưu handles TRƯỚC khi click "+ Add" Facebook vì popup FB OAuth sẽ mở ngay khi click!
             handles_before = set(driver.window_handles)
             affiliate_handle = driver.current_window_handle
@@ -2358,7 +2364,10 @@ def _register_affiliate(
 
             time.sleep(2)
         else:
-            logger.info("ℹ️ Chế độ Reg Gmail: Bỏ qua mục liên kết mạng xã hội (Media Information)...")
+            if is_shopee_ph and not skip_social_link:
+                logger.info("ℹ️ Shopee.PH: Bỏ qua bước thêm liên kết Facebook (không cần thêm FB)...")
+            else:
+                logger.info(f"ℹ️ {region_name}: Bỏ qua mục liên kết mạng xã hội (Media Information)...")
             # Nếu trang đăng ký chia nhiều bước (chưa hiện ô SĐT mà có nút Next / Skip) thì bấm chuyển sang bước Contact Info
             driver.implicitly_wait(0)
             try:
@@ -3158,7 +3167,10 @@ def register_shopee_affiliate(
         _switch_to_shopee_tab(driver)
         _enable_shopee_antibot_bypass(driver)
 
-        fb_profile_url = f"https://www.facebook.com/profile.php?id={fb_uid}" if fb_uid and not skip_social_link else ""
+        is_shopee_ph = (region_name or "").strip().lower() in ("shopee.ph", "shopee ph")
+        effective_skip_social = skip_social_link or is_shopee_ph
+
+        fb_profile_url = f"https://www.facebook.com/profile.php?id={fb_uid}" if fb_uid and not effective_skip_social else ""
         if fb_profile_url:
             logger.info(f"FB Profile URL: {fb_profile_url}")
 
@@ -3176,7 +3188,7 @@ def register_shopee_affiliate(
             region_name,
             hotmail_email,
             forwarding_domain,
-            skip_social_link=skip_social_link,
+            skip_social_link=effective_skip_social,
             login_method=login_method,
             gmail_password=gmail_password,
             recovery_email=recovery_email,

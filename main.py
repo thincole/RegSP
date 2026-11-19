@@ -296,7 +296,9 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
         # Bước 5: Reg aff Shopee theo thị trường chọn ở bước 2
         if 5 in selected_steps and not stop_flag.is_set():
             check_browser_alive(driver)
-            logger.info(f"Dòng {row_index} ({profile_name}): Bắt đầu Bước 5 - Reg Aff Shopee ({region})")
+            skip_social_for_region = (region == "Shopee.PH")
+            skip_note = " [Bỏ qua thêm FB]" if skip_social_for_region else ""
+            logger.info(f"Dòng {row_index} ({profile_name}): Bắt đầu Bước 5 - Reg Aff Shopee ({region}){skip_note}")
             aff_username, aff_id = "", ""
             shopee_err_msg = "reg Shopee lỗi"
             try:
@@ -307,6 +309,7 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
                     region,
                     parsed.get('hotmail_email', ''),
                     fwd_target_domain,
+                    skip_social_link=skip_social_for_region,
                     forward_email=fwd_email,
                 )
                 if isinstance(res, tuple):

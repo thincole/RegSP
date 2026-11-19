@@ -429,6 +429,49 @@ class OmocaptchaClient:
             raise OmocaptchaError("INVALID_SOLUTION", "ImageToTextTask không trả về text")
         return text
 
+    def solve_funcaptcha_image(
+        self,
+        image: str,
+        instruction: str,
+        timeout: float = 120.0,
+        stop_check: Optional[Callable[[], None]] = None,
+    ) -> int:
+        """
+        FuncaptchaImageTask -> vị trí (1-based) của ảnh đúng trong dãy.
+
+        `image`: ảnh challenge card (gồm câu hỏi + ảnh bên trái + dãy ảnh + mũi tên).
+        `instruction`: nguyên văn câu hỏi, ví dụ
+            "Use the arrows to pick the image where all the darts add up to the number in the left image".
+
+        Lưu ý theo tài liệu: server trả `index` là vị trí ảnh đúng trong dãy, còn trên web
+        phải bấm mũi tên phải `index - 1` lần vì ảnh captcha đang ở vị trí thứ nhất.
+        """
+        image_b64 = strip_data_uri(image)
+        if not image_b64:
+            raise OmocaptchaError("EMPTY_IMAGE", "Thiếu ảnh challenge FunCaptcha")
+
+        instruction = (instruction or "").strip()[:500]
+        if not instruction:
+            raise OmocaptchaError("ERROR_TYPE_JOB_REQUIRED", "Thiếu câu hỏi (task.other) cho FuncaptchaImageTask")
+
+        task: Dict[str, Any] = {
+            "type": "FuncaptchaImageTask",
+            "imageBase64": image_b64,
+            "other": instruction,
+        }
+        solution = self.solve(task, timeout=timeout, stop_check=stop_check)
+
+        try:
+            index = int(solution.get("index", 0) or 0)
+        except (TypeError, ValueError):
+            index = 0
+        if index <= 0:
+            raise OmocaptchaError(
+                "INVALID_SOLUTION", f"FuncaptchaImageTask trả index không hợp lệ: {solution}"
+            )
+        return index
+
+
 
 # ======================================================================
 # Cấu hình dùng chung toàn tiến trình

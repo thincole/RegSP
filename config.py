@@ -129,6 +129,11 @@ OMO_FALLBACK_MANUAL = os.getenv("OMO_FALLBACK_MANUAL", "1").strip().lower() not 
 OMO_SHOPEE_ROTATE = os.getenv("OMO_SHOPEE_ROTATE", "0").strip().lower() in ("1", "true", "yes", "on")
 OMO_DEBUG_IMAGES = os.getenv("OMO_DEBUG_IMAGES", "1").strip().lower() not in ("0", "false", "no", "off")
 
+# --- Facebook FunCaptcha (Arkose Labs) ---
+OMO_FB_ENABLED = os.getenv("OMO_FB_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+OMO_FB_MAX_ROUNDS = int(os.getenv("OMO_FB_MAX_ROUNDS", "6") or 6)            # Arkose thường 5 vòng
+OMO_FB_MAX_ATTEMPTS = int(os.getenv("OMO_FB_MAX_ATTEMPTS", "2") or 2)        # số lượt thử lại
+
 # ============================================================
 # LOGGING & VERSION
 # ============================================================

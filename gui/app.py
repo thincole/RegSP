@@ -333,7 +333,7 @@ class AutoLoginApp:
         self.omo_enabled_var = tk.BooleanVar(value=bool(getattr(config, 'OMO_ENABLED', True)))
         ttk.Checkbutton(
             omo_frame,
-            text="Tự động giải Captcha Shopee",
+            text="Tự động giải Captcha (Shopee + Facebook)",
             variable=self.omo_enabled_var,
         ).pack(side=tk.LEFT)
 

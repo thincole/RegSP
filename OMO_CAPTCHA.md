@@ -122,7 +122,57 @@ print(c.get_packages())
 
 ---
 
-## 6. Giới hạn đã biết
+## 6. Facebook FunCaptcha (Arkose Labs)
+
+Facebook chèn challenge Arkose ("Use the arrows to …") ngay ở bước xác minh
+`facebook.com/two_step_verification/authentication/...`. Nhánh này nằm trong
+`modules/facebook_captcha_solver.py`, được gọi từ `_wait_for_fb_captcha()`.
+
+Dạng challenge xử lý được (theo tài liệu OMOCaptcha `FuncaptchaImageTask`):
+- darts: "…pick the image where all the darts add up to the number in the left image"
+- rotate: "…rotate the object to face in the direction of the hand"
+- cup/match: "…match the icon on the left to the cup with the most liquid"
+
+Luồng mỗi vòng:
+```
+1. tìm iframe Arkose (src/id chứa arkose|funcaptcha|fc-…), hoặc Arkose render inline trong document chính
+2. đọc câu hỏi + đo khung challenge (khung nhỏ nhất chứa chữ "arrows"/"Submit" và >=2 ảnh)
+3. chụp đúng khung đó (toạ độ tuyệt đối = rect iframe + rect bên trong, hoặc rect trực tiếp nếu inline)
+4. POST createTask {type: FuncaptchaImageTask, imageBase64: <khung>, other: "<câu hỏi>"}
+5. nhận solution.index -> bấm mũi tên phải (index - 1) lần -> bấm Submit
+6. lặp cho các vòng "(x of N)", tối đa OMO_FB_MAX_ROUNDS
+```
+
+Biến riêng:
+
+| Biến | Mặc định | Ý nghĩa |
+|---|---|---|
+| `OMO_FB_ENABLED` | `1` | Bật/tắt riêng nhánh Facebook |
+| `OMO_FB_MAX_ROUNDS` | `6` | Số vòng challenge tối đa mỗi lượt |
+| `OMO_FB_MAX_ATTEMPTS` | `2` | Số lượt thử lại |
+
+**Cầu dao an toàn:** `FuncaptchaImageTask` lỗi `ERROR_JOB_STATUS` liên tiếp 3 lần
+(kể cả với ảnh mẫu chính chủ của OMOCaptcha) → tự tắt nhánh Facebook trong phiên đó
+và log `⛔ … tắt giải FunCaptcha tự động trong phiên này`, để không mỗi captcha lại
+chờ vô ích trước khi rơi về giải tay.
+
+## 7. Tình trạng kiểm thử thực tế (2026-11-19)
+
+| Hạng mục | Kết quả |
+|---|---|
+| Key + số dư | `balance 4.4574 USD`, `voucherBalance 0` |
+| `ShopeeSliderWebTask` với ảnh mẫu chính chủ của OMOCaptcha | **OK** — trả `solution.point = {x:140, y:75}` (đúng dạng phải trừ offset mảnh ghép) |
+| `ShopeeSliderWebTask` với ảnh slider tự dựng | job fail (đúng dự đoán — không phải ảnh thật), tiền tự hoàn |
+| `FuncaptchaImageTask` với **ảnh mẫu chính chủ** + đúng câu hỏi | **fail `ERROR_JOB_STATUS`** ở cả 4 biến thể: `other` / `other+text` / `text` / PNG gốc. Tiền tự hoàn (số dư không đổi) |
+| Nhận diện + chụp + bấm mũi tên + Submit (Facebook, 2 layout iframe & inline) | **OK** — 2 vòng, bấm phải 3 lần, Submit 2 lần, challenge đóng đúng |
+
+Nghĩa là: phần **client của nhánh Facebook đã đúng** (đã test bằng HTML giả lập cả
+2 layout), nhưng **endpoint FunCaptcha phía OMOCaptcha đang lỗi** — nó fail ngay trên
+ảnh mẫu do chính họ đăng trong tài liệu. Cần liên hệ OMOCaptcha để hỏi, hoặc chờ họ sửa;
+trong lúc đó cứ để `OMO_FB_ENABLED=1`, cầu dao sẽ tự tắt sau 3 lần lỗi và captcha
+quay về giải tay.
+
+## 8. Giới hạn đã biết
 
 - Captcha nằm trong **iframe** hoặc DOM đổi cấu trúc hoàn toàn: chỉ quét document chính
   → không nhận diện được, tự rơi về giải tay. Soi `*_dom.json` rồi bổ sung selector nếu cần.

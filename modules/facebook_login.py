@@ -11,6 +11,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 
 import config
+from modules import omocaptcha_api
 from modules.totp_generator import generate_2fa_code, get_remaining_seconds
 from utils.logger import get_logger
 from utils.wait_helpers import (
@@ -471,6 +472,88 @@ def _handle_2fa(driver: WebDriver, fb_2fa_secret: str) -> bool:
     return True
 
 
+def _try_auto_solve_fb_captcha(driver: WebDriver, reason: str = "") -> bool:
+    """
+    Thử giải FunCaptcha (Arkose Labs) của Facebook bằng OMOCaptcha.
+
+    Chỉ chạy khi đã bật OMOCaptcha + có API key + thực sự có iframe challenge.
+    Trả True nếu challenge đã được xử lý (luồng gọi tự kiểm tra lại trạng thái trang).
+    """
+    if not omocaptcha_api.is_enabled():
+        return False
+    if not bool(getattr(config, "OMO_FB_ENABLED", True)):
+        return False
+
+    try:
+        from modules.facebook_captcha_solver import (
+            solve_facebook_funcaptcha,
+            is_funcaptcha_present,
+        )
+    except Exception as e:
+        logger.error(f"❌ Không nạp được module giải FunCaptcha Facebook: {e}")
+        return False
+
+    try:
+        if not is_funcaptcha_present(driver):
+            return False
+    except (BrowserClosedError, LoginFailedError):
+        raise
+    except Exception as e:
+        if is_browser_closed_exception(e):
+            raise BrowserClosedError(f"Trình duyệt đã bị đóng: {e}") from e
+        logger.debug(f"Không kiểm tra được FunCaptcha: {e}")
+        return False
+
+    try:
+        attempts = max(1, int(getattr(config, "OMO_FB_MAX_ATTEMPTS", 2) or 2))
+    except (TypeError, ValueError):
+        attempts = 2
+
+    logger.warning(f"🤖 Phát hiện FunCaptcha (Arkose) của Facebook ({reason}) -> thử giải tự động...")
+
+    for attempt in range(1, attempts + 1):
+        check_browser_alive(driver)
+        logger.warning(f"🤖 [FB {attempt}/{attempts}] Gửi challenge lên OMOCaptcha...")
+        try:
+            solved, detail = solve_facebook_funcaptcha(driver, tag=f"fb_{attempt}")
+        except (BrowserClosedError, LoginFailedError):
+            raise
+        except Exception as e:
+            if is_browser_closed_exception(e):
+                raise BrowserClosedError(f"Trình duyệt đã bị đóng: {e}") from e
+            logger.error(f"❌ Lỗi khi giải FunCaptcha: {e}")
+            return False
+
+        if not solved:
+            logger.warning(f"⚠️ Không giải được FunCaptcha tự động: {detail}")
+            if "OMOCaptcha lỗi" in detail or "chưa cấu hình" in detail:
+                return False
+            time.sleep(1.5)
+            continue
+
+        logger.info(f"✅ FunCaptcha: {detail} -> chờ Facebook xác nhận...")
+
+        # Chờ challenge đóng hẳn
+        deadline = time.time() + 12.0
+        while time.time() < deadline:
+            time.sleep(1.5)
+            check_browser_alive(driver)
+            try:
+                if not is_funcaptcha_present(driver):
+                    logger.info("✅ Đã xử lý xong FunCaptcha Facebook bằng OMOCaptcha!")
+                    time.sleep(1.5)
+                    return True
+            except (BrowserClosedError, LoginFailedError):
+                raise
+            except Exception:
+                pass
+
+        logger.warning("⚠️ Challenge vẫn còn sau khi Submit, thử lượt khác...")
+        time.sleep(1.0)
+
+    return False
+
+
 def _wait_for_fb_captcha(driver: WebDriver, timeout: int = None) -> None:
     """
     Kiểm tra và chờ người dùng giải captcha Facebook (mặc định 5 phút = 300s, quét 5s/lần).
@@ -538,18 +621,36 @@ def _wait_for_fb_captcha(driver: WebDriver, timeout: int = None) -> None:
             return  # Không có captcha → tiếp tục bình thường
 
         logger.warning(f"⚠️ Facebook yêu cầu xác minh/CAPTCHA ({reason})! URL: {driver.current_url}")
-        logger.warning(f"⚠️ Vui lòng xử lý trên trình duyệt (chờ tối đa {timeout}s, quét {check_interval}s/lần)...")
 
+        # 1) Thử giải tự động FunCaptcha (Arkose) bằng OMOCaptcha trước khi chờ tay
+        auto_solved = False
         try:
-            driver.execute_cdp_cmd("Page.bringToFront", {})
-        except Exception:
-            pass
-        try:
-            import winsound
-            winsound.Beep(1000, 350)
-            winsound.Beep(1300, 350)
-        except Exception:
-            pass
+            auto_solved = _try_auto_solve_fb_captcha(driver, reason)
+        except (BrowserClosedError, LoginFailedError):
+            raise
+        except Exception as e:
+            if is_browser_closed_exception(e):
+                raise BrowserClosedError(f"Trình duyệt đã bị đóng: {e}") from e
+            logger.debug(f"Lỗi giải captcha Facebook tự động: {e}")
+
+        if auto_solved:
+            logger.info("✅ OMOCaptcha đã xử lý challenge -> chờ Facebook cập nhật trạng thái...")
+            time.sleep(1.5)
+        else:
+            # 2) Fallback: chờ người dùng giải tay như trước
+            logger.warning(
+                f"⚠️ Vui lòng xử lý trên trình duyệt (chờ tối đa {timeout}s, quét {check_interval}s/lần)..."
+            )
+            try:
+                driver.execute_cdp_cmd("Page.bringToFront", {})
+            except Exception:
+                pass
+            try:
+                import winsound
+                winsound.Beep(1000, 350)
+                winsound.Beep(1300, 350)
+            except Exception:
+                pass
 
         # Chờ captcha được giải (quét mỗi check_interval giây)
         start_time = time.time()
