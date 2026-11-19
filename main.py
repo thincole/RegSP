@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import tkinter as tk
 import config
 from utils.logger import setup_logger, get_logger
+from modules import omocaptcha_api
 from modules.google_sheets import read_sheet_data, write_cell
 from modules.data_parser import (
     parse_column_b,
@@ -698,6 +699,30 @@ def process_all_rows(gui_config, selected_steps, stop_flag, progress_callback, l
     mode_label = "Reg Gmail" if mode == "gmail" else "Reg Clone"
     max_threads = max(1, int(gui_config.get('MAX_THREADS', getattr(config, 'MAX_THREADS', 4))))
     logger.info(f"Bắt đầu xử lý [{mode_label}] (Số luồng chạy song song: {max_threads})...")
+
+    # Cấu hình OMOCaptcha (giải captcha Shopee tự động) cho toàn tiến trình.
+    # Key lấy từ GUI trước, thiếu thì rơi về config.py/.env.
+    omo_key = str(
+        gui_config.get('OMO_API_KEY') or getattr(config, 'OMO_API_KEY', '') or ''
+    ).strip()
+    omo_enabled = bool(gui_config.get('OMO_ENABLED', getattr(config, 'OMO_ENABLED', True)))
+    omocaptcha_api.configure(
+        api_key=omo_key,
+        enabled=omo_enabled,
+        base_url=getattr(config, 'OMO_BASE_URL', 'https://api.omocaptcha.com/v2'),
+        request_timeout=getattr(config, 'OMO_REQUEST_TIMEOUT', 30),
+        max_retries=getattr(config, 'OMO_MAX_TASK_RETRIES', 2),
+        solve_timeout=getattr(config, 'OMO_SOLVE_TIMEOUT', 120),
+        poll_interval=getattr(config, 'OMO_POLL_INTERVAL', 2),
+        drag_attempts=getattr(config, 'OMO_DRAG_ATTEMPTS', 3),
+        fallback_manual=getattr(config, 'OMO_FALLBACK_MANUAL', True),
+        shopee_rotate=getattr(config, 'OMO_SHOPEE_ROTATE', False),
+    )
+    if omo_enabled and omo_key:
+        logger.info("OMOCaptcha: đã bật giải captcha Shopee tự động (ShopeeSliderWebTask).")
+    elif omo_enabled:
+        logger.warning("OMOCaptcha: đã bật nhưng thiếu API Key -> captcha Shopee sẽ phải giải tay.")
+
     
     sheet_url = gui_config['GOOGLE_SHEET_URL']
     sheet_name = gui_config['SHEET_NAME']

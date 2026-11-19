@@ -20,6 +20,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
 
 import config
+from modules import omocaptcha_api
 from utils.logger import get_logger
 from modules.totp_generator import generate_2fa_code, get_remaining_seconds
 from utils.wait_helpers import (
@@ -65,6 +66,82 @@ def _is_shopee_phone_verification(driver: WebDriver) -> bool:
             driver.implicitly_wait(5)
         except Exception:
             pass
+    return False
+
+
+def _try_auto_solve_captcha(driver: WebDriver, probe, tag: str = "shopee") -> bool:
+    """
+    Thử giải captcha Shopee tự động bằng OMOCaptcha (ShopeeSliderWebTask).
+
+    probe(): callable trả (found, reason, hard_block) — dùng lại chính logic nhận diện
+    của _wait_for_captcha để không lệch định nghĩa "captcha còn hiển thị hay không".
+
+    Trả True nếu captcha đã biến mất, False nếu không giải được (để rơi về giải tay).
+    """
+    if not omocaptcha_api.is_enabled():
+        return False
+
+    try:
+        from modules.shopee_captcha_solver import solve_shopee_captcha
+    except Exception as e:
+        logger.error(f"❌ Không nạp được module giải captcha tự động: {e}")
+        return False
+
+    cfg = omocaptcha_api.get_config()
+    try:
+        attempts = max(1, int(cfg.get("drag_attempts", 3) or 3))
+    except (TypeError, ValueError):
+        attempts = 3
+
+    for attempt in range(1, attempts + 1):
+        check_browser_alive(driver)
+
+        found, reason, is_hard_block = probe()
+        if not found:
+            return True
+        if is_hard_block:
+            return False
+
+        logger.warning(
+            f"🤖 [{attempt}/{attempts}] Thử giải captcha Shopee tự động bằng OMOCaptcha... ({reason})"
+        )
+        try:
+            solved, detail = solve_shopee_captcha(driver, tag=f"{tag}_{attempt}")
+        except (LoginFailedError, BrowserClosedError):
+            raise
+        except Exception as e:
+            if is_browser_closed_exception(e):
+                raise BrowserClosedError(f"Trình duyệt đã bị đóng: {e}") from e
+            logger.error(f"❌ Lỗi khi giải captcha tự động: {e}")
+            return False
+
+        if not solved:
+            logger.warning(f"⚠️ Không giải được captcha tự động: {detail}")
+            # Lỗi cấu hình/key/API -> dừng, không đốt lượt vô ích
+            if ("OMOCaptcha lỗi" in detail) or ("chưa cấu hình" in detail):
+                return False
+            time.sleep(1.5)
+            continue
+
+        logger.info(f"🖱️ Đã kéo captcha ({detail}) -> chờ Shopee xác nhận...")
+
+        # Chờ captcha biến mất (Shopee có thể verify thêm vài giây sau khi thả chuột)
+        deadline = time.time() + 15.0
+        while time.time() < deadline:
+            time.sleep(1.5)
+            check_browser_alive(driver)
+            found, reason, is_hard_block = probe()
+            if not found:
+                logger.info("✅ Captcha Shopee đã được giải tự động bằng OMOCaptcha!")
+                time.sleep(1)
+                return True
+            if is_hard_block:
+                logger.warning(f"⚠️ Shopee chuyển sang màn hình chặn ({reason}) -> dừng giải tự động.")
+                return False
+
+        logger.warning("⚠️ Đã kéo nhưng captcha vẫn còn hiển thị, thử lại lượt khác...")
+        time.sleep(1.0)
+
     return False
 
 
@@ -161,8 +238,17 @@ def _wait_for_captcha(driver: WebDriver, timeout: int = None) -> bool:
             )
             return False
 
-        logger.warning(f"⚠️ CAPTCHA Shopee phát hiện! ({matched_reason}) -> Vui lòng giải Captcha trên trình duyệt...")
+        logger.warning(f"⚠️ CAPTCHA Shopee phát hiện! ({matched_reason})")
 
+        # 1) Thử giải tự động bằng OMOCaptcha (chỉ chạy khi đã bật + có API key)
+        if _try_auto_solve_captcha(driver, _is_captcha_present, tag="shopee"):
+            return True
+        if not bool(omocaptcha_api.get_config().get("fallback_manual", True)):
+            logger.error("❌ Không giải được captcha tự động và chế độ giải tay đang tắt.")
+            return False
+
+        # 2) Fallback: chờ người dùng giải tay như trước
+        logger.warning("⚠️ Chuyển sang chế độ giải Captcha bằng tay trên trình duyệt...")
         start_time = time.time()
         alerted_manual = False
 

@@ -323,7 +323,21 @@ class AutoLoginApp:
         self.entry_hupsms_service_id.insert(0, str(getattr(config, 'HUPSMS_SERVICE_ID', 0) or 0))
         self.entry_hupsms_service_id.pack(side=tk.LEFT, padx=(6, 0))
 
-        row_idx = 6
+        # OMOCaptcha - giải captcha Shopee tự động (dùng chung cả 2 tab)
+        omo_frame = ttk.Frame(main_frame)
+        omo_frame.grid(row=6, column=0, columnspan=3, sticky=tk.EW, pady=(8, 0))
+        ttk.Label(omo_frame, text="OMOCaptcha API Key:").pack(side=tk.LEFT)
+        self.entry_omo_api_key = ttk.Entry(omo_frame, width=48)
+        self.entry_omo_api_key.insert(0, getattr(config, 'OMO_API_KEY', ''))
+        self.entry_omo_api_key.pack(side=tk.LEFT, padx=(6, 12))
+        self.omo_enabled_var = tk.BooleanVar(value=bool(getattr(config, 'OMO_ENABLED', True)))
+        ttk.Checkbutton(
+            omo_frame,
+            text="Tự động giải Captcha Shopee",
+            variable=self.omo_enabled_var,
+        ).pack(side=tk.LEFT)
+
+        row_idx = 7
 
         # Buttons
         btn_frame = ttk.Frame(main_frame)
@@ -374,6 +388,7 @@ class AutoLoginApp:
                 (self.entry_gmail_shopee_pass, "gmail_shopee_pass"),
                 (self.entry_hupsms_api_key, "hupsms_api_key"),
                 (self.entry_hupsms_service_id, "hupsms_service_id"),
+                (self.entry_omo_api_key, "omo_api_key"),
             ]:
                 if key in settings and (
                     key != "hupsms_api_key"
@@ -382,6 +397,9 @@ class AutoLoginApp:
                 ):
                     entry.delete(0, tk.END)
                     entry.insert(0, str(settings[key]))
+
+            if "omo_enabled" in settings:
+                self.omo_enabled_var.set(bool(settings.get("omo_enabled")))
 
             # Tab đang chọn (0: Reg Clone, 1: Reg Gmail)
             active_tab = settings.get("active_tab", 0)
@@ -478,6 +496,8 @@ class AutoLoginApp:
             "gmail_shopee_market": self.gmail_shopee_region_var.get(),
             "hupsms_api_key": self.entry_hupsms_api_key.get().strip(),
             "hupsms_service_id": self.entry_hupsms_service_id.get().strip(),
+            "omo_api_key": self.entry_omo_api_key.get().strip(),
+            "omo_enabled": bool(self.omo_enabled_var.get()),
         }
         try:
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
@@ -557,6 +577,8 @@ class AutoLoginApp:
                 'GMAIL_FORWARDING_DOMAIN': self.gmail_forwarding_domain_var.get(),
                 'HUPSMS_API_KEY': self.entry_hupsms_api_key.get().strip(),
                 'HUPSMS_SERVICE_ID': self.entry_hupsms_service_id.get().strip(),
+                'OMO_API_KEY': self.entry_omo_api_key.get().strip(),
+                'OMO_ENABLED': bool(self.omo_enabled_var.get()),
             }
 
         return {
@@ -574,6 +596,8 @@ class AutoLoginApp:
             'HOTMAIL_CHANGE_RECOVERY': self.hotmail_change_recovery_var.get(),
             'HOTMAIL_RECOVERY_DOMAIN': self.hotmail_recovery_domain_var.get(),
             'HOTMAIL_FORWARDING_DOMAIN': self.hotmail_forwarding_domain_var.get(),
+            'OMO_API_KEY': self.entry_omo_api_key.get().strip(),
+            'OMO_ENABLED': bool(self.omo_enabled_var.get()),
         }
 
     def update_progress(self, current, total):

@@ -115,6 +115,21 @@ HUPSMS_SMS_TIMEOUT = int(os.getenv("HUPSMS_SMS_TIMEOUT", "180") or 180)
 HUPSMS_MAX_RETRIES = int(os.getenv("HUPSMS_MAX_RETRIES", "2") or 2)
 
 # ============================================================
+# OMOCaptcha API (giải captcha tự động - https://docs.omocaptcha.com)
+# ============================================================
+OMO_API_KEY = os.getenv("OMO_API_KEY", "").strip()
+OMO_ENABLED = os.getenv("OMO_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+OMO_BASE_URL = os.getenv("OMO_BASE_URL", "https://api.omocaptcha.com/v2").strip()
+OMO_REQUEST_TIMEOUT = int(os.getenv("OMO_REQUEST_TIMEOUT", "30") or 30)      # timeout 1 request HTTP
+OMO_SOLVE_TIMEOUT = int(os.getenv("OMO_SOLVE_TIMEOUT", "120") or 120)        # chờ solver trả kết quả
+OMO_POLL_INTERVAL = float(os.getenv("OMO_POLL_INTERVAL", "2") or 2)          # hỏi kết quả mỗi 2s
+OMO_MAX_TASK_RETRIES = int(os.getenv("OMO_MAX_TASK_RETRIES", "2") or 2)      # retry lỗi tạm thời
+OMO_DRAG_ATTEMPTS = int(os.getenv("OMO_DRAG_ATTEMPTS", "3") or 3)            # số lượt kéo/captcha
+OMO_FALLBACK_MANUAL = os.getenv("OMO_FALLBACK_MANUAL", "1").strip().lower() not in ("0", "false", "no", "off")
+OMO_SHOPEE_ROTATE = os.getenv("OMO_SHOPEE_ROTATE", "0").strip().lower() in ("1", "true", "yes", "on")
+OMO_DEBUG_IMAGES = os.getenv("OMO_DEBUG_IMAGES", "1").strip().lower() not in ("0", "false", "no", "off")
+
+# ============================================================
 # LOGGING & VERSION
 # ============================================================
 LOG_DIR = "logs"
