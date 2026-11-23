@@ -7,7 +7,7 @@ import re
 import time
 import unicodedata
 import urllib.request
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 from selenium.common.exceptions import TimeoutException
@@ -450,6 +450,20 @@ def _try_enter_phone_challenge_from_selection(driver: WebDriver, cur_url_low: st
     return False
 
 
+def _notify_verified_phone(
+    on_phone_verified: Optional[Callable[[str], None]],
+    phone_number: str,
+) -> None:
+    """Gọi callback lưu SĐT đã dùng verify Gmail (bắt lỗi an toàn để không làm gián đoạn luồng login)."""
+    phone_clean = (phone_number or "").strip()
+    if not phone_clean or on_phone_verified is None:
+        return
+    try:
+        on_phone_verified(phone_clean)
+    except Exception as e:
+        logger.warning(f"⚠️ Lỗi callback lưu SĐT verify Gmail ({phone_clean}): {e}")
+
+
 def _verify_google_sms_challenge(
     driver: WebDriver,
     hupsms_api_key: str,
@@ -458,6 +472,7 @@ def _verify_google_sms_challenge(
     hupsms_prefix: str = "",
     sms_timeout: int = 180,
     max_attempts: int = 2,
+    on_phone_verified: Optional[Callable[[str], None]] = None,
 ) -> bool:
     """
     Tự động thuê SIM VN qua HupSMS, nhập số lên màn hình Google và điền mã OTP SMS.
@@ -538,6 +553,7 @@ def _verify_google_sms_challenge(
                     break
                 if any(k in u_now for k in ("mail.google.com/mail", "speedbump", "gds.google.com", "myaccount.google.com", "passkeyenrollment")):
                     logger.info(f"✅ Google tự qua bước xác minh SĐT với {phone_local}!")
+                    _notify_verified_phone(on_phone_verified, phone_local)
                     return True
                 err_txt = _extract_google_phone_error(driver, b_now, _GOOGLE_PHONE_REJECT_KEYWORDS)
                 if err_txt:
@@ -597,12 +613,15 @@ def _verify_google_sms_challenge(
                     raise LoginFailedError(f"Google từ chối mã OTP {otp_code} ({otp_err})")
                 if "/signin/challenge/iap" not in u_after and _find_visible_phone_otp_input(driver, u_after, b_after) is None:
                     logger.info(f"✅ Xác minh SĐT Gmail thành công bằng HupSMS ({phone_local})!")
+                    _notify_verified_phone(on_phone_verified, phone_local)
                     return True
                 if any(k in u_after for k in ("mail.google.com/mail", "speedbump", "gds.google.com", "myaccount.google.com", "passkeyenrollment")):
                     logger.info(f"✅ Xác minh SĐT Gmail thành công bằng HupSMS ({phone_local})!")
+                    _notify_verified_phone(on_phone_verified, phone_local)
                     return True
 
             if _find_visible_phone_otp_input(driver, (driver.current_url or "").lower(), "") is None:
+                _notify_verified_phone(on_phone_verified, phone_local)
                 return True
             raise LoginFailedError(f"Đã nhập OTP {otp_code} nhưng Google vẫn giữ ở màn hình xác minh SĐT")
 
@@ -638,6 +657,7 @@ def _handle_google_post_login_prompts(
     hupsms_service_id: Optional[int] = None,
     hupsms_network: Optional[str] = None,
     hupsms_prefix: Optional[str] = None,
+    on_phone_verified: Optional[Callable[[str], None]] = None,
 ) -> None:
     """
     Xử lý các bước xác minh Mật khẩu / 2FA / Email khôi phục / SMS SĐT (HupSMS) / Passkey / Speedbump sau khi đăng nhập Google.
@@ -787,6 +807,7 @@ def _handle_google_post_login_prompts(
                     hupsms_prefix=sms_pre,
                     sms_timeout=sms_timeout,
                     max_attempts=sms_retries,
+                    on_phone_verified=on_phone_verified,
                 ):
                     continue
 
@@ -796,7 +817,16 @@ def _handle_google_post_login_prompts(
                 logger.info(f"⏳ Phát hiện {reason_msg}, đang chờ tối đa {max_wait}s để hoàn tất...")
                 resolved = False
                 waited = 0
+                manual_entered_phone = ""
                 while waited < max_wait:
+                    try:
+                        p_el = _find_visible_phone_input(driver)
+                        if p_el is not None:
+                            p_val = (p_el.get_attribute("value") or "").strip()
+                            if len(re.sub(r"\D", "", p_val)) >= 8:
+                                manual_entered_phone = p_val
+                    except Exception:
+                        pass
                     time.sleep(3)
                     waited += 3
                     check_browser_alive(driver)
@@ -811,6 +841,8 @@ def _handle_google_post_login_prompts(
                         resolved = True
                         break
                 if resolved:
+                    if manual_entered_phone:
+                        _notify_verified_phone(on_phone_verified, manual_entered_phone)
                     continue
                 raise LoginFailedError(reason_msg)
         except (BrowserClosedError, LoginFailedError):
@@ -835,6 +867,7 @@ def login_gmail(
     hupsms_service_id: Optional[int] = None,
     hupsms_network: Optional[str] = None,
     hupsms_prefix: Optional[str] = None,
+    on_phone_verified: Optional[Callable[[str], None]] = None,
 ) -> bool:
     """
     Bước 1a (Tab Reg Gmail): Đăng nhập tài khoản Gmail trên trình duyệt Gemlogin.
@@ -1005,6 +1038,7 @@ def login_gmail(
             hupsms_service_id=hupsms_service_id,
             hupsms_network=hupsms_network,
             hupsms_prefix=hupsms_prefix,
+            on_phone_verified=on_phone_verified,
         )
 
         if not _is_gmail_inbox_loaded(driver):
@@ -1021,6 +1055,7 @@ def login_gmail(
                 hupsms_service_id=hupsms_service_id,
                 hupsms_network=hupsms_network,
                 hupsms_prefix=hupsms_prefix,
+                on_phone_verified=on_phone_verified,
             )
 
         if _is_gmail_inbox_loaded(driver):
@@ -2233,6 +2268,9 @@ def setup_gmail_forwarding(
     target_domain: str = TEMPMAIL_DOMAIN,
     recovery_email: str = "",
     twofa_secret: str = "",
+    hupsms_api_key: Optional[str] = None,
+    hupsms_service_id: Optional[int] = None,
+    on_phone_verified: Optional[Callable[[str], None]] = None,
 ) -> str:
     """
     Bước 1b (Tab Reg Gmail): Cài đặt chuyển tiếp thư từ Gmail về <prefix>@<target_domain> (mặc định @nguyenmaucole.io.vn).
@@ -2249,7 +2287,16 @@ def setup_gmail_forwarding(
 
     try:
         if not _is_gmail_inbox_loaded(driver):
-            login_gmail(driver, gmail_email, gmail_password, recovery_email, twofa_secret)
+            login_gmail(
+                driver,
+                gmail_email,
+                gmail_password,
+                recovery_email,
+                twofa_secret,
+                hupsms_api_key=hupsms_api_key,
+                hupsms_service_id=hupsms_service_id,
+                on_phone_verified=on_phone_verified,
+            )
 
         _safe_get(driver, GMAIL_FWD_SETTINGS_URL)
         wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)

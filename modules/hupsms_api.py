@@ -4,7 +4,7 @@ Dùng cho luồng xác minh SĐT khi đăng nhập Gmail/Google.
 """
 import re
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import requests
 
@@ -14,6 +14,33 @@ logger = get_logger()
 
 DEFAULT_HUPSMS_BASE_URL = "https://hupsms.com/api/v1"
 _NON_GMAIL_GOOGLE_KEYWORDS = ("youtube", "voice", "ads", "cloud", "play", "drive")
+DEFAULT_EXCLUDED_SERVERS = ("Server 1",)
+
+
+def _canonical_server_key(server_value: Any) -> str:
+    """Chuẩn hóa tên server (VD: 'Server 1', 'server1', 'SV1', '1' -> '1'; 'Server 10' -> '10')."""
+    s = re.sub(r"\s+", " ", str(server_value or "").strip().lower())
+    if not s:
+        return ""
+    m = re.match(r"^(?:server|sv|s)\s*[-_:#]?\s*(\d+)\b", s)
+    if m:
+        return m.group(1)
+    if s.isdigit():
+        return s
+    return s
+
+
+def is_excluded_server(
+    server_value: Any,
+    excluded_servers: Optional[Iterable[str]] = None,
+) -> bool:
+    """Kiểm tra server có nằm trong danh sách loại trừ hay không (mặc định loại Server 1)."""
+    targets = DEFAULT_EXCLUDED_SERVERS if excluded_servers is None else excluded_servers
+    key = _canonical_server_key(server_value)
+    if not key:
+        return False
+    excluded_keys = {_canonical_server_key(x) for x in targets if str(x or "").strip()}
+    return key in excluded_keys
 
 
 class HupSmsError(Exception):
@@ -181,15 +208,19 @@ class HupSmsClient:
         self,
         max_price: Optional[int] = None,
         server: Optional[str] = None,
+        exclude_servers: Optional[Iterable[str]] = DEFAULT_EXCLUDED_SERVERS,
         stop_check: Optional[Callable[[], None]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Tìm các dịch vụ Google/Gmail và sắp xếp ưu tiên dịch vụ chuẩn, giá thấp và timeout phù hợp.
+        Mặc định loại trừ Server 1.
         """
         services = self.get_services(server=server, stop_check=stop_check)
         candidates: List[Dict[str, Any]] = []
         for svc in services:
             if not isinstance(svc, dict):
+                continue
+            if exclude_servers and is_excluded_server(svc.get("server"), exclude_servers):
                 continue
             name_low = str(svc.get("name", "")).strip().lower()
             if not ("google" in name_low or "gmail" in name_low):
@@ -244,12 +275,13 @@ class HupSmsClient:
         network: str = "",
         prefix: str = "",
         exclude_service_ids: Optional[List[int]] = None,
+        exclude_servers: Optional[Iterable[str]] = DEFAULT_EXCLUDED_SERVERS,
         stop_check: Optional[Callable[[], None]] = None,
     ) -> Dict[str, Any]:
         """
         Thuê số cho Google/Gmail:
-        - Nếu `service_id > 0`: ưu tiên dùng đúng Service ID được chỉ định.
-        - Nếu `service_id <= 0`: tự động lấy danh sách Google/Gmail vừa túi tiền và fallback qua từng server.
+        - Nếu `service_id > 0`: ưu tiên dùng đúng Service ID được chỉ định (từ chối nếu thuộc server bị loại trừ).
+        - Nếu `service_id <= 0`: tự động lấy danh sách Google/Gmail vừa túi tiền và fallback qua từng server (mặc định không thuê Server 1).
         - Tự bỏ qua `network` nếu server trả `INVALID_PARAMETERS` do không hỗ trợ chọn nhà mạng.
         """
         balance = self.get_balance(stop_check=stop_check)
@@ -257,12 +289,23 @@ class HupSmsClient:
             raise HupSmsError("INSUFFICIENT_BALANCE", f"Số dư HupSMS hiện bằng {balance}đ")
 
         excluded = set(int(x) for x in (exclude_service_ids or []) if x)
-        all_google = self.find_google_services(max_price=None, stop_check=stop_check)
-        svc_map = {int(s["id"]): s for s in all_google if "id" in s}
+        raw_google = self.find_google_services(max_price=None, exclude_servers=(), stop_check=stop_check)
+        svc_map = {int(s["id"]): s for s in raw_google if "id" in s}
+        all_google = [
+            s for s in raw_google
+            if not (exclude_servers and is_excluded_server(s.get("server"), exclude_servers))
+        ]
 
         candidate_ids: List[int] = []
         if service_id and int(service_id) > 0:
-            candidate_ids = [int(service_id)]
+            sid_int = int(service_id)
+            svc_info = svc_map.get(sid_int, {})
+            if exclude_servers and is_excluded_server(svc_info.get("server"), exclude_servers):
+                raise HupSmsError(
+                    "SERVER_EXCLUDED",
+                    f"Không thuê dịch vụ ID={sid_int} ({svc_info.get('server')}) vì thuộc danh sách server bị loại trừ",
+                )
+            candidate_ids = [sid_int]
         else:
             affordable = [
                 int(s["id"])
@@ -276,7 +319,7 @@ class HupSmsClient:
                         "INSUFFICIENT_BALANCE",
                         f"Số dư HupSMS ({balance}đ) không đủ thuê Google/Gmail (rẻ nhất {min_price}đ)",
                     )
-                raise HupSmsError("SERVICE_NOT_FOUND", "Không tìm thấy dịch vụ Google/Gmail trên HupSMS")
+                raise HupSmsError("SERVICE_NOT_FOUND", "Không tìm thấy dịch vụ Google/Gmail phù hợp trên HupSMS (đã loại Server 1)")
             candidate_ids = affordable
 
         last_err: Optional[HupSmsError] = None

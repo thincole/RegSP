@@ -20,6 +20,7 @@ START_ROW = int(os.getenv("START_ROW", "55"))
 END_ROW = int(os.getenv("END_ROW", "0"))  # 0 = đọc hết
 
 COL_DATA = "B"              # Cột chứa FB + Hotmail info
+COL_GMAIL_VERIFY_PHONE = "C"  # Cột ghi SĐT dùng verify khi login Gmail
 COL_PROFILE = "E"           # Cột chứa tên Profile Gemlogin
 COL_STATUS = "D"            # Cột ghi trạng thái ("FB die", "reg Shopee lỗi")
 COL_USERNAME = "F"          # Cột ghi Username Shopee.PH Affiliate

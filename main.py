@@ -296,8 +296,9 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
         # Bước 5: Reg aff Shopee theo thị trường chọn ở bước 2
         if 5 in selected_steps and not stop_flag.is_set():
             check_browser_alive(driver)
+            is_my_or_id = region in ("Shopee MY", "Shopee ID")
             skip_social_for_region = (region == "Shopee.PH")
-            skip_note = " [Bỏ qua thêm FB]" if skip_social_for_region else ""
+            skip_note = " [Chọn Shopee]" if is_my_or_id else (" [Bỏ qua thêm FB]" if skip_social_for_region else "")
             logger.info(f"Dòng {row_index} ({profile_name}): Bắt đầu Bước 5 - Reg Aff Shopee ({region}){skip_note}")
             aff_username, aff_id = "", ""
             shopee_err_msg = "reg Shopee lỗi"
@@ -493,6 +494,17 @@ def _process_single_row_gmail(row, gui_config, selected_steps, stop_flag):
             logger.info(
                 f"Dòng {row_index} ({profile_name}): Bắt đầu Bước 1 - Login Gmail & Thêm Forwarding về @{fwd_target_domain}"
             )
+
+            def _save_verified_gmail_phone(phone_num: str):
+                col_c = getattr(config, 'COL_GMAIL_VERIFY_PHONE', 'C')
+                ok_phone = write_cell(
+                    sheet_url, sheet_name, row_index, col_c, phone_num, sa_file, raw=True
+                )
+                if ok_phone:
+                    logger.info(
+                        f"Dòng {row_index} ({profile_name}): Đã lưu SĐT verify Gmail '{phone_num}' vào cột {col_c}."
+                    )
+
             try:
                 gm_ok = login_gmail(
                     driver,
@@ -502,6 +514,7 @@ def _process_single_row_gmail(row, gui_config, selected_steps, stop_flag):
                     twofa_secret,
                     hupsms_api_key=hupsms_api_key,
                     hupsms_service_id=hupsms_service_id,
+                    on_phone_verified=_save_verified_gmail_phone,
                 )
             except BrowserClosedError:
                 raise
@@ -526,6 +539,9 @@ def _process_single_row_gmail(row, gui_config, selected_steps, stop_flag):
                     target_domain=fwd_target_domain,
                     recovery_email=recovery_email,
                     twofa_secret=twofa_secret,
+                    hupsms_api_key=hupsms_api_key,
+                    hupsms_service_id=hupsms_service_id,
+                    on_phone_verified=_save_verified_gmail_phone,
                 )
             except BrowserClosedError:
                 raise
@@ -584,10 +600,13 @@ def _process_single_row_gmail(row, gui_config, selected_steps, stop_flag):
                 return
             logger.info(f"Dòng {row_index} ({profile_name}): Login {region} bằng Gmail thành công.")
 
-        # Bước 3: Reg AFF Shopee theo thị trường chọn ở bước 2 (bỏ qua Media Information)
+        # Bước 3: Reg AFF Shopee theo thị trường chọn ở bước 2 (Shopee MY/ID chọn Shopee; Shopee.PH bỏ qua MXH)
         if 3 in selected_steps and not stop_flag.is_set():
             check_browser_alive(driver)
-            logger.info(f"Dòng {row_index} ({profile_name}): Bắt đầu Bước 3 - Reg AFF Shopee ({region}) [Bỏ qua MXH]")
+            is_my_or_id = region in ("Shopee MY", "Shopee ID")
+            skip_social_for_gmail = not is_my_or_id
+            step3_note = "[Chọn Shopee]" if is_my_or_id else "[Bỏ qua MXH]"
+            logger.info(f"Dòng {row_index} ({profile_name}): Bắt đầu Bước 3 - Reg AFF Shopee ({region}) {step3_note}")
             aff_username, aff_id = "", ""
             shopee_err_msg = "reg Shopee lỗi"
             try:
@@ -598,7 +617,7 @@ def _process_single_row_gmail(row, gui_config, selected_steps, stop_flag):
                     region,
                     gmail_email,
                     fwd_target_domain,
-                    skip_social_link=True,
+                    skip_social_link=skip_social_for_gmail,
                     login_method="google",
                     gmail_password=gmail_password,
                     recovery_email=recovery_email,

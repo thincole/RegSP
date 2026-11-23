@@ -2074,6 +2074,170 @@ def change_shopee_password(
         return False
 
 
+def _is_shopee_ph_region(region_name: str = "", affiliate_url: str = "") -> bool:
+    reg = (region_name or "").strip().lower()
+    url = (affiliate_url or "").strip().lower()
+    return reg in ("shopee.ph", "shopee ph") or "affiliate.shopee.ph" in url
+
+
+def _is_shopee_my_or_id_region(region_name: str = "", affiliate_url: str = "") -> bool:
+    reg = (region_name or "").strip().lower()
+    url = (affiliate_url or "").strip().lower()
+    return (
+        reg in ("shopee my", "shopee.my", "shopee id", "shopee.id")
+        or "affiliate.shopee.com.my" in url
+        or "affiliate.shopee.co.id" in url
+    )
+
+
+def _is_shopee_platform_linked(driver: WebDriver) -> bool:
+    """Kiểm tra xem nền tảng Shopee đã được liên kết trên trang Affiliate auth?step=1 chưa."""
+    try:
+        return bool(
+            driver.execute_script(
+                """
+                const accounts = document.querySelector('.social-media-accounts');
+                if (accounts) {
+                    const items = accounts.querySelectorAll('.social-media-accounts-item, [type="social_media/ic-media-shopee"]');
+                    for (const it of items) {
+                        const st = getComputedStyle(it);
+                        if (st.display !== 'none' && st.visibility !== 'hidden') return true;
+                    }
+                    const tip = accounts.querySelector('.social-media-accounts-success-tip');
+                    if (tip && (tip.innerText || '').trim().length > 0) return true;
+                }
+                const cards = Array.from(document.querySelectorAll('.social-media-platforms-item-container, .social-media-platforms-item-wrapper'));
+                const shopeeCard = cards.find(c => {
+                    if (c.querySelector('[type="social_media/ic-media-shopee"]')) return true;
+                    const nm = c.querySelector('.social-media-platforms-name');
+                    return nm && (nm.textContent || '').trim().toLowerCase() === 'shopee';
+                });
+                if (shopeeCard && accounts) {
+                    const addEl = shopeeCard.querySelector('.social-media-platforms-add-text, .social-media-platforms-add');
+                    if (!addEl) return true;
+                }
+                return false;
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
+def _link_shopee_promotion_platform(driver: WebDriver, region_name: str) -> bool:
+    """
+    Liên kết nền tảng 'Shopee' (+ Add) trên trang đăng ký Affiliate cho Shopee MY / Shopee ID
+    (thay thế bước thêm Facebook).
+    """
+    if _is_shopee_platform_linked(driver):
+        logger.info(f"✅ {region_name}: Nền tảng Shopee đã được liên kết sẵn trong Promotion Platform!")
+        return True
+
+    logger.info(f"Đang tìm nút '+ Add' ở mục Shopee ({region_name})...")
+    shopee_add_selectors = [
+        (
+            By.XPATH,
+            "//div[contains(@class, 'social-media-platforms-item-wrapper')]"
+            "[.//*[@type='social_media/ic-media-shopee'] or .//*[contains(@class, 'social-media-platforms-name') and normalize-space()='Shopee']]"
+            "//*[contains(@class, 'social-media-platforms-add-text') or contains(@class, 'social-media-platforms-add')]",
+        ),
+        (
+            By.XPATH,
+            "//div[contains(@class, 'social-media-platforms-item-container')]"
+            "[.//*[@type='social_media/ic-media-shopee'] or .//*[normalize-space()='Shopee']]"
+            "//*[contains(@class, 'social-media-platforms-add-text') or normalize-space()='Add' or normalize-space()='+ Add' or normalize-space()='Tambah']",
+        ),
+    ]
+
+    clicked = False
+    for by, value in shopee_add_selectors:
+        try:
+            btn = wait_for_element(driver, by, value, timeout=5, condition="clickable")
+            if btn:
+                logger.info(f"Tìm thấy nút + Add Shopee: '{btn.text.strip()}' (selector: {value})")
+                try:
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+                    time.sleep(0.3)
+                except Exception:
+                    pass
+                if not safe_click(btn, delay=1.5):
+                    driver.execute_script("arguments[0].click();", btn)
+                    time.sleep(1.5)
+                clicked = True
+                break
+        except Exception:
+            continue
+
+    if not clicked:
+        # Fallback JS: chỉ click nút Add bên trong đúng card Shopee (tuyệt đối không nhảy sang Tiktok/FB)
+        try:
+            js_res = driver.execute_script(
+                """
+                const containers = Array.from(document.querySelectorAll('.social-media-platforms-item-container, .social-media-platforms-item-wrapper'));
+                const card = containers.find(c => {
+                    if (c.querySelector('[type="social_media/ic-media-shopee"]')) return true;
+                    const nm = c.querySelector('.social-media-platforms-name');
+                    return nm && (nm.textContent || '').trim().toLowerCase() === 'shopee';
+                });
+                if (!card) return 'NO_SHOPEE_CARD';
+                const addBtn = card.querySelector('.social-media-platforms-add-text, .social-media-platforms-add, button, a');
+                if (!addBtn) return 'NO_ADD_BTN';
+                addBtn.scrollIntoView({block: 'center'});
+                addBtn.click();
+                return 'CLICKED';
+                """
+            )
+            if js_res == "CLICKED":
+                logger.info("✅ Đã click nút + Add Shopee (JS fallback)")
+                clicked = True
+                time.sleep(1.5)
+            elif js_res == "NO_ADD_BTN" and _is_shopee_platform_linked(driver):
+                logger.info(f"✅ {region_name}: Nền tảng Shopee đã được liên kết sẵn!")
+                return True
+        except Exception as e:
+            logger.debug(f"Lỗi JS fallback khi click + Add Shopee: {e}")
+
+    if not clicked:
+        if _is_shopee_platform_linked(driver):
+            logger.info(f"✅ {region_name}: Nền tảng Shopee đã được liên kết sẵn!")
+            return True
+        logger.error(f"❌ Không tìm thấy nút '+ Add' Shopee trên {region_name}")
+        return False
+
+    # Chờ xác nhận liên kết thành công (và tự bấm Confirm nếu có modal xác nhận phát sinh trên MY/ID)
+    for _ in range(16):
+        if _is_shopee_platform_linked(driver):
+            logger.info(f"✅ Đã liên kết nền tảng Shopee thành công ({region_name})!")
+            time.sleep(1.0)
+            return True
+
+        driver.implicitly_wait(0)
+        try:
+            confirm_btns = [
+                b for b in driver.find_elements(
+                    By.XPATH,
+                    "//div[contains(@class, 'ant-modal')]//button[contains(@class, 'ant-btn-primary') "
+                    "or contains(., 'Confirm') or contains(., 'Konfirmasi') or normalize-space()='OK']",
+                )
+                if b.is_displayed() and b.is_enabled()
+            ]
+            if confirm_btns:
+                logger.info(f"Phát hiện modal xác nhận khi liên kết Shopee -> Click '{confirm_btns[0].text.strip()}'...")
+                if not safe_click(confirm_btns[0], delay=1.5):
+                    driver.execute_script("arguments[0].click();", confirm_btns[0])
+                    time.sleep(1.5)
+                continue
+        except Exception:
+            pass
+        finally:
+            driver.implicitly_wait(5)
+
+        time.sleep(0.5)
+
+    logger.warning(f"⚠️ Đã click '+ Add' Shopee trên {region_name} nhưng chưa thấy xác nhận Linked Account, vẫn tiếp tục...")
+    return True
+
+
 def _register_affiliate(
     driver: WebDriver, affiliate_url: str, fb_profile_url: str,
     fb_uid: str, fb_password: str, region_name: str,
@@ -2089,7 +2253,10 @@ def _register_affiliate(
     """
     Đăng ký Shopee Affiliate:
     1. Truy cập trang affiliate
-    2. (Nếu skip_social_link=False và không phải Shopee.PH) Click "+ Add" Facebook → xử lý popup FB OAuth → điền link FB → click Confirm
+    2. Promotion Platform:
+       - Shopee MY / Shopee ID: Click "+ Add" ở mục Shopee (thay thế bước thêm Facebook)
+       - Shopee.PH: Bỏ qua bước thêm liên kết MXH
+       - Thị trường khác (nếu skip_social_link=False): Click "+ Add" Facebook → popup FB OAuth → điền link FB → Confirm
     3. Điền số điện thoại → click "Verify & Submit"
     4. Chọn "Verify with Email" → click "Confirm"
     5. Lấy mã OTP từ <prefix>@<forwarding_domain> → điền mã → click "Next"
@@ -2217,13 +2384,14 @@ def _register_affiliate(
             logger.info("Tài khoản đã hoàn tất đăng ký Affiliate trước đó! Chuyển sang lấy Account Setting...")
             return _get_affiliate_account_setting(driver, affiliate_url)
 
-        is_shopee_ph = (
-            (region_name or "").strip().lower() in ("shopee.ph", "shopee ph")
-            or "affiliate.shopee.ph" in (affiliate_url or "").lower()
-        )
-        effective_skip_social = skip_social_link or is_shopee_ph
+        is_shopee_ph = _is_shopee_ph_region(region_name, affiliate_url)
+        is_shopee_my_or_id = _is_shopee_my_or_id_region(region_name, affiliate_url)
+        effective_skip_social = (skip_social_link or is_shopee_ph) and not is_shopee_my_or_id
 
-        if not effective_skip_social:
+        if is_shopee_my_or_id:
+            if not _link_shopee_promotion_platform(driver, region_name):
+                return "", ""
+        elif not effective_skip_social:
             # Lưu handles TRƯỚC khi click "+ Add" Facebook vì popup FB OAuth sẽ mở ngay khi click!
             handles_before = set(driver.window_handles)
             affiliate_handle = driver.current_window_handle
@@ -3167,17 +3335,22 @@ def register_shopee_affiliate(
         _switch_to_shopee_tab(driver)
         _enable_shopee_antibot_bypass(driver)
 
-        is_shopee_ph = (region_name or "").strip().lower() in ("shopee.ph", "shopee ph")
-        effective_skip_social = skip_social_link or is_shopee_ph
-
-        fb_profile_url = f"https://www.facebook.com/profile.php?id={fb_uid}" if fb_uid and not effective_skip_social else ""
-        if fb_profile_url:
-            logger.info(f"FB Profile URL: {fb_profile_url}")
-
         affiliate_url = config.SHOPEE_AFFILIATE_URLS.get(region_name, "")
         if not affiliate_url:
             logger.error(f"Không tìm thấy URL Affiliate cho thị trường {region_name}")
             return False, "", ""
+
+        is_shopee_ph = _is_shopee_ph_region(region_name, affiliate_url)
+        is_shopee_my_or_id = _is_shopee_my_or_id_region(region_name, affiliate_url)
+        effective_skip_social = (skip_social_link or is_shopee_ph) and not is_shopee_my_or_id
+
+        fb_profile_url = (
+            f"https://www.facebook.com/profile.php?id={fb_uid}"
+            if fb_uid and not effective_skip_social and not is_shopee_my_or_id
+            else ""
+        )
+        if fb_profile_url:
+            logger.info(f"FB Profile URL: {fb_profile_url}")
 
         username, affiliate_id = _register_affiliate(
             driver,

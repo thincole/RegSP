@@ -197,18 +197,20 @@ def write_cell(
     sheet_url: str, sheet_name: str, row_index: int,
     col_letter: str, value: str,
     service_account_file: str,
+    raw: bool = False,
 ) -> bool:
     """
     Ghi giá trị vào ô cụ thể trên Google Sheet.
-    Dùng để ghi "FB die" hoặc "reg Shopee lỗi" vào Cột D.
+    Dùng để ghi "FB die", "reg Shopee lỗi" vào Cột D, SĐT verify Gmail vào Cột C, v.v.
 
     Args:
         sheet_url: URL Google Sheet.
         sheet_name: Tên sheet tab.
         row_index: Số hàng (1-indexed).
-        col_letter: Ký tự cột (VD: 'D').
+        col_letter: Ký tự cột (VD: 'C', 'D').
         value: Giá trị cần ghi.
         service_account_file: Đường dẫn file JSON.
+        raw: True để ghi dạng chuỗi RAW (giữ nguyên số 0 đầu như SĐT '09xxxxxxxx').
 
     Returns:
         True nếu ghi thành công.
@@ -220,8 +222,12 @@ def write_cell(
             spreadsheet = client.open_by_key(sheet_id)
             worksheet = spreadsheet.worksheet(sheet_name)
 
-            col_index = _col_letter_to_index(col_letter) + 1  # gspread dùng 1-indexed
-            worksheet.update_cell(row_index, col_index, value)
+            if raw:
+                cell_ref = f"{col_letter.upper()}{row_index}"
+                worksheet.update(values=[[str(value)]], range_name=cell_ref, raw=True)
+            else:
+                col_index = _col_letter_to_index(col_letter) + 1  # gspread dùng 1-indexed
+                worksheet.update_cell(row_index, col_index, value)
 
             logger.info(f"Đã ghi '{value}' vào ô {col_letter}{row_index}")
             return True
