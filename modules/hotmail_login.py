@@ -2,9 +2,11 @@
 Bước 2: Tự động đăng nhập Hotmail trên Tab 2.
 CHỈ chạy khi Bước 1 (Facebook login) thành công.
 """
+import html as html_lib
 import re
 import time
 import threading
+import unicodedata
 from typing import Optional
 
 import requests
@@ -50,6 +52,33 @@ BOXNT_DOMAINS = (
 BOXNT_WEB_URL = f"https://{BOXNT_DOMAIN}/"
 BOXNT_API_BASE = f"https://{BOXNT_DOMAIN}/api/v1"
 
+GETNADA_DOMAIN = "getnada.com"
+GETNADA_DOMAINS = (
+    "getnada.com",
+    "nada.email",
+    "nada.ltd",
+    "inboxes.com",
+    "blondmail.com",
+    "chapsmail.com",
+    "clowmail.com",
+    "dropjar.com",
+    "fivermail.com",
+    "getairmail.com",
+    "getmule.com",
+    "gimpmail.com",
+    "givmail.com",
+    "guysmail.com",
+    "inboxbear.com",
+    "replyloop.com",
+    "robot-mail.com",
+    "tafmail.com",
+    "temptami.com",
+    "tupmail.com",
+    "vomoto.com",
+)
+GETNADA_WEB_URL = "https://inboxes.com/"
+GETNADA_API_BASE = "https://inboxes.com/api/v2"
+
 _thread_ctx = threading.local()
 _global_default_recovery_domain = TEMPMAIL_DOMAIN
 
@@ -79,6 +108,17 @@ def _is_boxnt_domain(text_or_domain: str) -> bool:
     """Kiểm tra xem chuỗi/domain có thuộc hệ thống boxnt.com (TmpMails.Net) không."""
     t = (text_or_domain or "").lower()
     return any(d in t for d in BOXNT_DOMAINS)
+
+
+def _norm_text(s: str) -> str:
+    """Chuẩn hóa Unicode NFC + lowercase (Microsoft tiếng Việt hay trả dạng NFD như 'Să\\u0301p hoa\\u0300n tha\\u0300nh')."""
+    return unicodedata.normalize("NFC", s or "").lower()
+
+
+def _is_getnada_domain(text_or_domain: str) -> bool:
+    """Kiểm tra xem chuỗi/domain có thuộc hệ thống inboxes.com / getnada.com không."""
+    t = (text_or_domain or "").lower()
+    return any(d in t for d in GETNADA_DOMAINS)
 
 
 def _open_new_tab(driver: WebDriver, url: str) -> bool:
@@ -364,7 +404,7 @@ def _submit_password_with_fallbacks(driver: WebDriver, candidates: list) -> bool
                     pwd_accepted = True
                     break
                 try:
-                    body_lower = (driver.find_element(By.TAG_NAME, "body").text or "").lower()
+                    body_lower = _norm_text(driver.find_element(By.TAG_NAME, "body").text)
                 except Exception:
                     body_lower = ""
 
@@ -463,8 +503,8 @@ def _try_use_your_password(
 
     # Nếu tất cả mật khẩu đều không đúng và có nút "Send a code to ..." -> chuyển sang lấy code qua email khôi phục
     try:
-        body_lower = driver.find_element(By.TAG_NAME, "body").text.lower()
-        if "incorrect" in body_lower or "không chính xác" in body_lower:
+        body_lower = _norm_text(driver.find_element(By.TAG_NAME, "body").text)
+        if "incorrect" in body_lower or "không chính xác" in body_lower or "không đúng" in body_lower:
             send_code_link = wait_for_element(
                 driver,
                 By.XPATH,
@@ -480,6 +520,26 @@ def _try_use_your_password(
                 logger.info("Click 'Send a code to ...' để xác minh qua email khôi phục")
                 if not safe_click(send_code_link, delay=2.0):
                     driver.execute_script("arguments[0].click();", send_code_link)
+                    time.sleep(2.0)
+            else:
+                # Fallback JS chuẩn hóa NFC cho chuỗi NFD tiếng Việt ('Gửi mã đến ...')
+                clicked_js = driver.execute_script(
+                    """
+                    const els = Array.from(document.querySelectorAll('button, a, span, div[role="button"]'));
+                    for (let i = els.length - 1; i >= 0; i--) {
+                        const el = els[i];
+                        if (el.offsetParent === null) continue;
+                        const t = (el.innerText || '').normalize('NFC').trim().toLowerCase();
+                        if (t.length > 0 && t.length < 100 && (t.includes('send a code') || t.includes('gửi mã đến') || t === 'gửi mã')) {
+                            el.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                    """
+                )
+                if clicked_js:
+                    logger.info("Click 'Send a code / Gửi mã đến ...' (JS NFC fallback)")
                     time.sleep(2.0)
     except Exception:
         pass
@@ -509,7 +569,7 @@ def _enter_password(
                 body_text = driver.find_element(By.TAG_NAME, "body").text
             except Exception:
                 body_text = ""
-            body_lower = body_text.lower()
+            body_lower = _norm_text(body_text)
 
             # 1. Nếu đã chuyển thẳng sang các màn hình sau đăng nhập (Passkey, Stay signed in, TOU, Looks good, Outlook...)
             if (
@@ -519,9 +579,12 @@ def _enter_password(
                     "fido/create", "tou/accrue", "proofs/remind",
                 ])
                 or "stay signed in?" in body_lower
+                or "duy trì đăng nhập?" in body_lower
                 or "setting up your passkey" in body_lower
                 or "is your security info still accurate" in body_lower
+                or "thông tin bảo mật của bạn vẫn chính xác" in body_lower
                 or "looks good!" in body_lower
+                or "trông ổn" in body_lower
             ):
                 logger.info("Tài khoản đã chuyển thẳng qua bước sau đăng nhập / bảo mật")
                 return True
@@ -548,22 +611,28 @@ def _enter_password(
                     return True
                 try:
                     body_text = driver.find_element(By.TAG_NAME, "body").text
-                    body_lower = body_text.lower()
+                    body_lower = _norm_text(body_text)
                 except Exception:
                     pass
 
-            # 4. Nếu trang hiện "Almost there" / "Verify your email" / "Verify your identity" hoặc ô nhập code 6 số
+            # 4. Nếu trang hiện "Almost there" / "Sắp hoàn thành" / "Verify your email" / "Xác minh email" hoặc ô nhập code 6 số
             if (
                 "almost there" in body_lower
                 or "just one more step" in body_lower
                 or "send a code to" in body_lower
                 or "verify your email" in body_lower
                 or "verify your identity" in body_lower
+                or "sắp hoàn thành" in body_lower
+                or "một bước nữa" in body_lower
+                or "gửi mã đến" in body_lower
+                or "xác minh email" in body_lower
+                or "xác minh danh tính" in body_lower
                 or TEMPMAIL_DOMAIN in body_lower
                 or _is_fvia_domain(body_lower)
                 or _is_boxnt_domain(body_lower)
+                or _is_getnada_domain(body_lower)
             ) and (hotmail_email or recovery_email):
-                logger.info("Phát hiện màn hình xác minh ('Almost there' / 'Verify your email') -> Xử lý qua email khôi phục...")
+                logger.info("Phát hiện màn hình xác minh ('Almost there' / 'Sắp hoàn thành' / 'Verify your email') -> Xử lý qua email khôi phục...")
                 driver.implicitly_wait(5)
                 if _handle_add_recovery_email(driver, hotmail_email, recovery_email, fallback_pass=fallback_password or password):
                     return True
@@ -587,8 +656,8 @@ def _enter_password(
 
     # Nếu tất cả mật khẩu đều báo sai -> thử bấm 'Send a code to ...' nếu có
     try:
-        body_lower = driver.find_element(By.TAG_NAME, "body").text.lower()
-        if "incorrect" in body_lower or "không chính xác" in body_lower:
+        body_lower = _norm_text(driver.find_element(By.TAG_NAME, "body").text)
+        if "incorrect" in body_lower or "không chính xác" in body_lower or "không đúng" in body_lower:
             send_code_link = wait_for_element(
                 driver,
                 By.XPATH,
@@ -1137,6 +1206,223 @@ def _fetch_code_from_boxnt(
     return None
 
 
+def _extract_ms_code_from_email_content(
+    subject: str = "",
+    body_text: str = "",
+    body_html: str = "",
+) -> Optional[str]:
+    """Trích xuất mã xác nhận 6-7 số của Microsoft từ subject/text/html (đã loại <style>/<script>)."""
+    cleaned_html = re.sub(r"<(style|script)\b[^>]*>.*?</\1>", " ", body_html or "", flags=re.IGNORECASE | re.DOTALL)
+    cleaned_html = html_lib.unescape(re.sub(r"<[^>]+>", " ", cleaned_html))
+    combined = f"{body_text or ''} {cleaned_html} {subject or ''}"
+    combined = re.sub(r"\s+", " ", combined).strip()
+    if not combined:
+        return None
+
+    m = re.search(
+        r"(?:security\s*code|single-use\s*code(?:\s*is)?|verification\s*code(?:\s*is)?|code\s*is|mã\s*bảo\s*mật|mã\s*xác\s*minh)[^0-9]{0,40}(\d{6,7})\b",
+        combined,
+        re.IGNORECASE,
+    )
+    if m:
+        return m.group(1)
+    m6 = re.search(r"(?<!\d)(\d{6})(?!\d)", combined)
+    if m6:
+        return m6.group(1)
+    m7 = re.search(r"(?<!\d)(\d{7})(?!\d)", combined)
+    if m7:
+        return m7.group(1)
+    return None
+
+
+def _get_existing_getnada_ids(prefix: str, domain: str = GETNADA_DOMAIN) -> set:
+    """Lấy danh sách UID thư cũ hiện có trong hòm thư inboxes.com / getnada.com."""
+    seen_ids = set()
+    username = prefix.strip().lower()
+    target_domain = (domain or GETNADA_DOMAIN).strip().lower()
+    full_email = f"{username}@{target_domain}"
+    try:
+        resp = requests.get(
+            f"{GETNADA_API_BASE}/inbox/{full_email}",
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+            timeout=12,
+        )
+        if resp.status_code == 200:
+            data = resp.json() or {}
+            msgs = data.get("msgs") if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            for msg in msgs or []:
+                if isinstance(msg, dict) and msg.get("uid"):
+                    seen_ids.add(str(msg["uid"]))
+    except Exception as e:
+        logger.debug(f"Lỗi khi khởi tạo hòm thư inboxes.com ({full_email}): {e}")
+    return seen_ids
+
+
+def _fetch_code_from_getnada(
+    driver: WebDriver,
+    prefix: str,
+    domain: str = GETNADA_DOMAIN,
+    seen_ids: Optional[set] = None,
+    timeout: int = 90,
+) -> Optional[str]:
+    """
+    Lấy mã xác nhận 6-7 số từ hệ thống inboxes.com / getnada.com (hỗ trợ @getnada.com và các domain inboxes.com).
+    Ưu tiên gọi API v2 (/api/v2/inbox/{email} -> /api/v2/message/{uid}), fallback mở tab https://inboxes.com/ nếu API bị chặn/timeout.
+    """
+    seen_ids = set(seen_ids or set())
+    username = prefix.strip().lower()
+    target_domain = (domain or GETNADA_DOMAIN).strip().lower()
+    full_email = f"{username}@{target_domain}"
+    logger.info(f"Đang chờ mã xác nhận gửi về: {full_email} (trên inboxes.com / {target_domain}) ...")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+    }
+    session = requests.Session()
+    start_time = time.time()
+    api_deadline = start_time + min(timeout, 65)
+    consecutive_errors = 0
+    checked_no_code = set()
+
+    # Bước 1: Gọi trực tiếp REST API v2 của inboxes.com
+    while time.time() < api_deadline:
+        check_browser_alive(driver)
+        try:
+            resp = session.get(f"{GETNADA_API_BASE}/inbox/{full_email}", headers=headers, timeout=15)
+            if resp.status_code in (401, 403, 429):
+                logger.info(f"inboxes.com API trả HTTP {resp.status_code} -> Chuyển sang tab trình duyệt inboxes.com...")
+                break
+            if resp.status_code == 200:
+                consecutive_errors = 0
+                data = resp.json() or {}
+                msgs = data.get("msgs") if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                # Sắp xếp thư mới nhất lên đầu theo trường 'r' (timestamp)
+                msgs_sorted = sorted(
+                    [m for m in (msgs or []) if isinstance(m, dict)],
+                    key=lambda m: int(m.get("r", 0) or 0),
+                    reverse=True,
+                )
+                for msg in msgs_sorted:
+                    uid = str(msg.get("uid", "") or "").strip()
+                    if not uid or uid in seen_ids or uid in checked_no_code:
+                        continue
+                    subject = str(msg.get("s", "") or "")
+                    body_text = ""
+                    body_html = ""
+                    try:
+                        m_resp = session.get(f"{GETNADA_API_BASE}/message/{uid}", headers=headers, timeout=15)
+                        if m_resp.status_code == 200:
+                            m_data = m_resp.json() or {}
+                            msg_obj = m_data.get("msg") if isinstance(m_data.get("msg"), dict) else m_data
+                            if isinstance(msg_obj, dict):
+                                subject = str(msg_obj.get("s", subject) or subject)
+                                body_text = str(msg_obj.get("text", "") or "")
+                                body_html = str(msg_obj.get("html", "") or "")
+                    except Exception as m_err:
+                        logger.debug(f"Lỗi đọc chi tiết thư inboxes.com ({uid}): {m_err}")
+
+                    if not body_text and not body_html:
+                        try:
+                            h_resp = session.get(f"{GETNADA_API_BASE}/message/html/{uid}", headers=headers, timeout=15)
+                            if h_resp.status_code == 200:
+                                body_html = h_resp.text or ""
+                        except Exception:
+                            pass
+
+                    code = _extract_ms_code_from_email_content(subject, body_text, body_html)
+                    if code:
+                        logger.info(f"✅ Đã lấy được mã xác nhận từ {target_domain} (API inboxes.com): {code}")
+                        return code
+                    if body_text or body_html:
+                        checked_no_code.add(uid)
+            else:
+                consecutive_errors += 1
+        except Exception as e:
+            consecutive_errors += 1
+            logger.debug(f"Lỗi khi gọi API inboxes.com ({full_email}): {e}")
+            if consecutive_errors >= 4:
+                logger.info("inboxes.com API lỗi kết nối liên tiếp -> Chuyển sang tab trình duyệt inboxes.com...")
+                break
+
+        time.sleep(3)
+
+    # Bước 2: Fallback mở https://inboxes.com/ trên trình duyệt Gemlogin và dùng fetch cùng origin
+    remaining = timeout - (time.time() - start_time)
+    if remaining < 8:
+        remaining = 25
+    logger.info(f"Mở trang {GETNADA_WEB_URL} trên trình duyệt để lấy mã cho {full_email}...")
+    current_handle = driver.current_window_handle
+    try:
+        driver.execute_script(f"window.open('{GETNADA_WEB_URL}', '_blank');")
+        time.sleep(2)
+        driver.switch_to.window(driver.window_handles[-1])
+        wait_for_page_load(driver, timeout=15)
+        time.sleep(2)
+
+        web_deadline = time.time() + remaining
+        while time.time() < web_deadline:
+            check_browser_alive(driver)
+            try:
+                inbox_res = driver.execute_async_script(
+                    """
+                    const email = arguments[0];
+                    const done = arguments[arguments.length - 1];
+                    fetch('/api/v2/inbox/' + encodeURIComponent(email), {headers: {'Accept': 'application/json'}})
+                      .then(r => r.ok ? r.json() : null)
+                      .then(d => done(d))
+                      .catch(() => done(null));
+                    """,
+                    full_email,
+                )
+                msgs = (inbox_res or {}).get("msgs") if isinstance(inbox_res, dict) else []
+                msgs_sorted = sorted(
+                    [m for m in (msgs or []) if isinstance(m, dict)],
+                    key=lambda m: int(m.get("r", 0) or 0),
+                    reverse=True,
+                )
+                for msg in msgs_sorted:
+                    uid = str(msg.get("uid", "") or "").strip()
+                    if not uid or uid in seen_ids or uid in checked_no_code:
+                        continue
+                    subject = str(msg.get("s", "") or "")
+                    m_data = driver.execute_async_script(
+                        """
+                        const uid = arguments[0];
+                        const done = arguments[arguments.length - 1];
+                        fetch('/api/v2/message/' + encodeURIComponent(uid), {headers: {'Accept': 'application/json'}})
+                          .then(r => r.ok ? r.json() : null)
+                          .then(d => done(d))
+                          .catch(() => done(null));
+                        """,
+                        uid,
+                    )
+                    msg_obj = (m_data or {}).get("msg") if isinstance(m_data, dict) and isinstance(m_data.get("msg"), dict) else (m_data or {})
+                    body_text = str(msg_obj.get("text", "") or "") if isinstance(msg_obj, dict) else ""
+                    body_html = str(msg_obj.get("html", "") or "") if isinstance(msg_obj, dict) else ""
+                    code = _extract_ms_code_from_email_content(subject, body_text, body_html)
+                    if code:
+                        logger.info(f"✅ Đã lấy được mã trên web inboxes.com ({target_domain}): {code}")
+                        return code
+                    if body_text or body_html:
+                        checked_no_code.add(uid)
+            except Exception as web_err:
+                logger.debug(f"Lỗi fetch trên tab inboxes.com: {web_err}")
+            time.sleep(3)
+    except Exception as e:
+        logger.warning(f"Lỗi khi lấy code trên web inboxes.com: {e}")
+    finally:
+        try:
+            if driver.current_window_handle != current_handle and len(driver.window_handles) > 1:
+                driver.close()
+            driver.switch_to.window(current_handle)
+        except Exception:
+            pass
+
+    logger.error(f"⏰ Hết thời gian chờ mã xác nhận cho {full_email}")
+    return None
+
+
 def _resolve_recovery_email(
     hotmail_email: str,
     recovery_email: str,
@@ -1165,6 +1451,12 @@ def _resolve_recovery_email(
             if recovery_email and boxnt_dom in recovery_email.lower():
                 return recovery_email.strip()
             return f"{prefix}@{boxnt_dom}"
+
+    for getnada_dom in GETNADA_DOMAINS:
+        if getnada_dom in body_lower:
+            if recovery_email and getnada_dom in recovery_email.lower():
+                return recovery_email.strip()
+            return f"{prefix}@{getnada_dom}"
 
     for fvia_dom in FVIA_DOMAINS:
         if fvia_dom in body_lower:
@@ -1203,11 +1495,13 @@ def _handle_add_recovery_email(
         body_text = ""
 
     # Ưu tiên số 0: Nếu màn hình là "Is your security info still accurate?" -> bấm "Looks good!"
-    body_lower_init = body_text.lower()
+    body_lower_init = _norm_text(body_text)
     if (
         "proofs/remind" in (driver.current_url or "").lower()
         or "is your security info still accurate" in body_lower_init
         or "looks good!" in body_lower_init
+        or "thông tin bảo mật của bạn vẫn chính xác" in body_lower_init
+        or "trông ổn" in body_lower_init
     ):
         looks_good_btn = wait_for_element(
             driver,
@@ -1241,11 +1535,16 @@ def _handle_add_recovery_email(
             return True
         try:
             body_text = driver.find_element(By.TAG_NAME, "body").text
-            body_lower_init = body_text.lower()
+            body_lower_init = _norm_text(body_text)
         except Exception:
             pass
 
-    is_adding_new = "help protect your account" in body_lower_init or "add an email" in body_lower_init
+    is_adding_new = (
+        "help protect your account" in body_lower_init
+        or "add an email" in body_lower_init
+        or "thêm một địa chỉ email" in body_lower_init
+        or "thêm địa chỉ email" in body_lower_init
+    )
     target_recovery_email = _resolve_recovery_email(
         hotmail_email, recovery_email, body_text, preferred_domain=preferred_domain, is_adding_new=is_adding_new
     )
@@ -1266,6 +1565,8 @@ def _handle_add_recovery_email(
             code = _fetch_code_from_fviainboxes(driver, rec_prefix, domain=rec_domain, seen_ids=set(), timeout=90)
         elif _is_boxnt_domain(rec_domain):
             code = _fetch_code_from_boxnt(driver, rec_prefix, domain=rec_domain, seen_ids=set(), timeout=90)
+        elif _is_getnada_domain(rec_domain):
+            code = _fetch_code_from_getnada(driver, rec_prefix, domain=rec_domain, seen_ids=set(), timeout=90)
         else:
             code = _fetch_code_from_tempmail(driver, rec_prefix, min_id=0, timeout=90)
         if not code:
@@ -1350,14 +1651,22 @@ def _handle_add_recovery_email(
         except Exception:
             pass
 
-    # Bước 1b: Nếu đang ở màn hình "Almost there" ("Send a code to ...") hoặc "Verify your identity" chọn phương thức nhận code qua email
-    body_lower_curr = body_text.lower()
+    # Bước 1b: Nếu đang ở màn hình "Almost there" / "Sắp hoàn thành" ("Send a code to ..." / "Gửi mã đến ...") hoặc "Verify your identity"
+    body_lower_curr = _norm_text(body_text)
+    is_verify_email_input_screen = (
+        "verify your email" in body_lower_curr
+        or "xác minh email" in body_lower_curr
+    )
     if (
         "almost there" in body_lower_curr
         or "just one more step" in body_lower_curr
         or "send a code to" in body_lower_curr
-        or ("verify your identity" in body_lower_curr and "verify your email" not in body_lower_curr)
+        or "sắp hoàn thành" in body_lower_curr
+        or "một bước nữa" in body_lower_curr
+        or "gửi mã đến" in body_lower_curr
+        or (("verify your identity" in body_lower_curr or "xác minh danh tính" in body_lower_curr) and not is_verify_email_input_screen)
     ):
+        rec_dom_xpath = f" or contains(., '{rec_domain}')" if rec_domain else ""
         email_option = wait_for_element(
             driver,
             By.XPATH,
@@ -1365,15 +1674,55 @@ def _handle_add_recovery_email(
             " | //a[contains(., 'Send a code') or contains(., 'Gửi mã')]"
             " | //*[@role='button' or contains(@class, 'fui-Link')][contains(., 'Send a code') or contains(., 'Gửi mã')]"
             " | //span[contains(text(), 'Send a code') or contains(text(), 'Gửi mã')]"
-            f" | //div[@role='button' or contains(@class, 'tile')][contains(., '{TEMPMAIL_DOMAIN}') or contains(., 'fvia') or contains(., 'boxnt') or contains(., 'tempinbox') or contains(., 'tmpmails') or contains(., 'Email ')]",
+            f" | //div[@role='button' or contains(@class, 'tile')][contains(., '{TEMPMAIL_DOMAIN}') or contains(., 'fvia') or contains(., 'boxnt') or contains(., 'tempinbox') or contains(., 'tmpmails') or contains(., 'getnada'){rec_dom_xpath} or contains(., 'Email ')]",
             timeout=3,
             condition="clickable",
         )
+        clicked_option = False
         if email_option:
             if not safe_click(email_option, delay=2.0):
                 driver.execute_script("arguments[0].click();", email_option)
                 time.sleep(2.0)
-            logger.info("Đã chọn phương thức 'Send a code to ...' / xác minh qua Email khôi phục")
+            clicked_option = True
+        else:
+            # Fallback JS chuẩn hóa NFC (xử lý chữ 'Gửi mã đến ...' dạng NFD hoặc thẻ div/button không khớp XPath)
+            try:
+                clicked_option = bool(
+                    driver.execute_script(
+                        """
+                        const recDom = (arguments[0] || '').toLowerCase();
+                        const candidates = Array.from(document.querySelectorAll('button, a, div[role="button"], li, [class*="tile"], span'));
+                        for (const el of candidates) {
+                            if (el.offsetParent === null) continue;
+                            const txt = (el.innerText || '').normalize('NFC').trim().toLowerCase();
+                            if (!txt || txt.length > 140) continue;
+                            if (
+                                txt.includes('send a code')
+                                || txt.includes('gửi mã đến')
+                                || (recDom && txt.includes(recDom))
+                                || txt.includes('@getnada.com')
+                                || txt.includes('@fviainboxes.com')
+                                || txt.includes('@boxnt.com')
+                                || txt.includes('@nguyenmaucole.io.vn')
+                            ) {
+                                const clickable = el.closest('button, a, [role="button"], li') || el;
+                                clickable.scrollIntoView({block: 'center'});
+                                clickable.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                        """,
+                        rec_domain,
+                    )
+                )
+                if clicked_option:
+                    time.sleep(2.0)
+            except Exception as js_opt_err:
+                logger.debug(f"Lỗi JS click chọn phương thức gửi mã: {js_opt_err}")
+
+        if clicked_option:
+            logger.info("Đã chọn phương thức 'Send a code to ... / Gửi mã đến ...' qua Email khôi phục")
             try:
                 body_text = driver.find_element(By.TAG_NAME, "body").text
                 target_recovery_email = _resolve_recovery_email(
@@ -1403,10 +1752,13 @@ def _handle_add_recovery_email(
     min_mail_id = 0
     fvia_seen_ids = set()
     boxnt_seen_ids = set()
+    getnada_seen_ids = set()
     if _is_fvia_domain(rec_domain):
         fvia_seen_ids = _get_existing_fviainboxes_ids(rec_prefix, domain=rec_domain)
     elif _is_boxnt_domain(rec_domain):
         boxnt_seen_ids = _get_existing_boxnt_ids(rec_prefix, domain=rec_domain)
+    elif _is_getnada_domain(rec_domain):
+        getnada_seen_ids = _get_existing_getnada_ids(rec_prefix, domain=rec_domain)
     else:
         min_mail_id = _get_latest_tempmail_id(rec_prefix)
 
@@ -1503,6 +1855,7 @@ def _handle_add_recovery_email(
             return False
         fvia_seen_ids = set()
         boxnt_seen_ids = set()
+        getnada_seen_ids = set()
         min_mail_id = 0
 
     # Bước 3: Chờ ô nhập code 6 số xuất hiện (6 ô codeEntry-0..5 hoặc 1 ô đơn #iOttText / ottCode) — tuyệt đối không bắt nhầm input[type='email']
@@ -1529,11 +1882,13 @@ def _handle_add_recovery_email(
 
     is_six_boxes = (code_el.get_attribute("id") or "") == "codeEntry-0"
 
-    # Lấy code từ fviainboxes.com, boxnt.com, hoặc mail.nguyenmaucole.io.vn
+    # Lấy code từ fviainboxes.com, boxnt.com, inboxes.com (getnada.com), hoặc mail.nguyenmaucole.io.vn
     if _is_fvia_domain(rec_domain):
         code = _fetch_code_from_fviainboxes(driver, rec_prefix, domain=rec_domain, seen_ids=fvia_seen_ids, timeout=90)
     elif _is_boxnt_domain(rec_domain):
         code = _fetch_code_from_boxnt(driver, rec_prefix, domain=rec_domain, seen_ids=boxnt_seen_ids, timeout=90)
+    elif _is_getnada_domain(rec_domain):
+        code = _fetch_code_from_getnada(driver, rec_prefix, domain=rec_domain, seen_ids=getnada_seen_ids, timeout=90)
     else:
         code = _fetch_code_from_tempmail(driver, rec_prefix, min_id=min_mail_id, timeout=90)
 
@@ -1563,8 +1918,8 @@ def _handle_add_recovery_email(
         logger.info(f"Đang điền mã {code} vào ô xác nhận...")
         safe_send_keys(code_el, code, delay=1.0)
         verify_btn_selectors = [
-            (By.CSS_SELECTOR, "#iVerifyCodeAction"),
-            (By.XPATH, "//button[contains(., 'Next') or contains(., 'Verify') or contains(., 'Xác minh')]"),
+            (By.CSS_SELECTOR, "#iVerifyCodeAction, button[data-testid='primaryButton']"),
+            (By.XPATH, "//button[contains(., 'Next') or contains(., 'Verify') or contains(., 'Xác minh') or contains(., 'Tiếp theo')]"),
             (By.CSS_SELECTOR, "button[type='submit'], input[type='submit'], #iNext, #idSIButton9"),
         ]
         for by, val in verify_btn_selectors:
@@ -1598,15 +1953,27 @@ def handle_microsoft_prompts(
         time.sleep(2)
         try:
             current_url = driver.current_url.lower()
-            # Nếu đã vào hòm thư Outlook hoặc trang quản lý chung thì dừng kiểm tra prompt
+            # Nếu đã vào hòm thư Outlook hoặc trang Manage Proofs đã mở sẵn thì dừng kiểm tra prompt
             if "outlook.live.com" in current_url or "office.com" in current_url:
                 break
+            if "proofs/manage" in current_url:
+                driver.implicitly_wait(0)
+                try:
+                    if any(
+                        el.is_displayed()
+                        for el in driver.find_elements(
+                            By.CSS_SELECTOR, "#ManageProofs, #AddProofLink, div[data-mp-proof-type='email']"
+                        )
+                    ):
+                        break
+                finally:
+                    driver.implicitly_wait(5)
 
             try:
                 body_text = driver.find_element(By.TAG_NAME, "body").text
             except Exception:
                 body_text = ""
-            body_lower = body_text.lower()
+            body_lower = _norm_text(body_text)
 
             # 0. Nếu hiện màn hình có nút 'Use your password' -> ưu tiên mật khẩu hiện tại, fallback sang 'Khoa01@@c'
             if "use your password" in body_lower or "dùng mật khẩu" in body_lower or "sử dụng mật khẩu" in body_lower:
@@ -1618,7 +1985,7 @@ def handle_microsoft_prompts(
                     continue
                 try:
                     body_text = driver.find_element(By.TAG_NAME, "body").text
-                    body_lower = body_text.lower()
+                    body_lower = _norm_text(body_text)
                 except Exception:
                     pass
 
@@ -1627,6 +1994,8 @@ def handle_microsoft_prompts(
                 "proofs/remind" in current_url
                 or "is your security info still accurate" in body_lower
                 or "looks good!" in body_lower
+                or "thông tin bảo mật của bạn vẫn chính xác" in body_lower
+                or "trông ổn" in body_lower
             ):
                 looks_good_btn = wait_for_element(
                     driver,
@@ -1639,7 +2008,7 @@ def handle_microsoft_prompts(
                     looks_good_btn = wait_for_element(
                         driver,
                         By.XPATH,
-                        "//button[contains(., 'Looks good')] | //input[contains(@value, 'Looks good')] | //a[contains(., 'Looks good')]",
+                        "//button[contains(., 'Looks good') or contains(., 'Trông ổn')] | //input[contains(@value, 'Looks good') or contains(@value, 'Trông ổn')] | //a[contains(., 'Looks good') or contains(., 'Trông ổn')]",
                         timeout=2,
                         condition="clickable",
                     )
@@ -1651,7 +2020,7 @@ def handle_microsoft_prompts(
                     continue
 
             # 1c. Nếu ở trang "Let's protect your account" (proofs/Add) có nút "Skip for now" (#iShowSkip) -> bấm Skip
-            if "proofs/add" in current_url or "let's protect your account" in body_lower:
+            if "proofs/add" in current_url or "let's protect your account" in body_lower or "hãy bảo vệ tài khoản" in body_lower:
                 skip_btn = wait_for_element(
                     driver,
                     By.CSS_SELECTOR,
@@ -1663,7 +2032,7 @@ def handle_microsoft_prompts(
                     skip_btn = wait_for_element(
                         driver,
                         By.XPATH,
-                        "//a[contains(., 'Skip for now') or contains(., 'Bỏ qua')] | //button[contains(., 'Skip for now') or contains(., 'Bỏ qua')]",
+                        "//a[contains(., 'Skip for now') or contains(., 'Bỏ qua') or contains(., 'Để sau')] | //button[contains(., 'Skip for now') or contains(., 'Bỏ qua') or contains(., 'Để sau')]",
                         timeout=2,
                         condition="clickable",
                     )
@@ -1681,6 +2050,8 @@ def handle_microsoft_prompts(
                 or "help protect your account" in body_lower
                 or "help us protect your account" in body_lower
                 or "add an email address" in body_lower
+                or "giúp chúng tôi bảo vệ tài khoản" in body_lower
+                or "thêm một địa chỉ email" in body_lower
             ):
                 if not _handle_add_recovery_email(
                     driver, hotmail_email, recovery_email, fallback_pass=primary_pwd, preferred_domain=preferred_domain
@@ -1688,7 +2059,7 @@ def handle_microsoft_prompts(
                     break
                 continue
 
-            # 1b. Màn hình Almost there / Verify your identity / Verify your email (khi tài khoản đã gắn email khôi phục trước đó)
+            # 1b. Màn hình Almost there / Sắp hoàn thành / Verify your identity / Verify your email (khi tài khoản đã gắn email khôi phục trước đó)
             if (
                 "almost there" in body_lower
                 or "just one more step" in body_lower
@@ -1696,8 +2067,16 @@ def handle_microsoft_prompts(
                 or "verify your identity" in body_lower
                 or "verify your email" in body_lower
                 or "we need to verify your identity" in body_lower
+                or "sắp hoàn thành" in body_lower
+                or "một bước nữa" in body_lower
+                or "gửi mã đến" in body_lower
+                or "xác minh danh tính" in body_lower
+                or "xác minh email" in body_lower
+                or _is_getnada_domain(body_lower)
+                or _is_boxnt_domain(body_lower)
+                or _is_fvia_domain(body_lower)
             ):
-                logger.info("Phát hiện màn hình xác minh danh tính ('Almost there' / 'Verify your email')...")
+                logger.info("Phát hiện màn hình xác minh danh tính ('Almost there' / 'Sắp hoàn thành' / 'Verify your email')...")
                 if not _handle_add_recovery_email(
                     driver, hotmail_email, recovery_email, fallback_pass=primary_pwd, preferred_domain=preferred_domain
                 ):
@@ -1716,7 +2095,7 @@ def handle_microsoft_prompts(
                     continue
 
             # 2b. Màn hình Setting up your passkey... (fido/create) -> bấm Cancel (#idBtn_Back / input[value='Cancel'])
-            if "fido/create" in current_url or "passkey" in body_lower:
+            if "fido/create" in current_url or "passkey" in body_lower or "khóa truy cập" in body_lower:
                 logger.info("Phát hiện màn hình 'Setting up your passkey...' -> Bấm 'Cancel'")
                 cancel_btn = wait_for_element(
                     driver,
@@ -1741,7 +2120,7 @@ def handle_microsoft_prompts(
                     continue
 
             # 3. Màn hình Privacy Notice ("A quick note about your Microsoft account" -> nút OK)
-            if "privacynotice" in current_url or "a quick note about your microsoft account" in body_lower:
+            if "privacynotice" in current_url or "a quick note about your microsoft account" in body_lower or "lưu ý nhanh về tài khoản microsoft" in body_lower:
                 ok_btn = wait_for_element(
                     driver, By.XPATH, "//button[normalize-space()='OK']", timeout=3, condition="clickable"
                 )
@@ -1750,23 +2129,43 @@ def handle_microsoft_prompts(
                     logger.info("Đã click 'OK' trên trang Privacy Notice")
                     continue
 
-            # 4. Màn hình "Stay signed in?" -> nút Yes
+            # 4. Màn hình "Stay signed in?" / "Duy trì đăng nhập?" -> nút Yes / Có (ưu tiên primaryButton / #acceptButton để tránh lệch NFD 'Co\u0301')
             if "stay signed in?" in body_lower or "duy trì đăng nhập?" in body_lower:
                 yes_selectors = [
+                    (By.CSS_SELECTOR, "button[data-testid='primaryButton'], #acceptButton, #idSIButton9, button[type='submit'], input[type='submit']"),
                     (By.XPATH, "//button[normalize-space()='Yes']"),
                     (By.XPATH, "//button[normalize-space()='Có']"),
-                    (By.ID, "idSIButton9"),
-                    (By.CSS_SELECTOR, "button[type='submit']"),
-                    (By.CSS_SELECTOR, "input[type='submit']"),
                 ]
                 clicked_yes = False
                 for by, val in yes_selectors:
                     yes_btn = wait_for_element(driver, by, val, timeout=3, condition="clickable")
                     if yes_btn:
-                        safe_click(yes_btn, delay=3.0)
-                        logger.info("Đã xử lý popup 'Stay signed in?' (Yes)")
+                        if not safe_click(yes_btn, delay=3.0):
+                            driver.execute_script("arguments[0].click();", yes_btn)
+                            time.sleep(3.0)
+                        logger.info("Đã xử lý popup 'Stay signed in?' (Yes / Có)")
                         clicked_yes = True
                         break
+                if not clicked_yes:
+                    clicked_yes = bool(
+                        driver.execute_script(
+                            """
+                            const btns = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"]'));
+                            for (const b of btns) {
+                                if (b.offsetParent === null) continue;
+                                const t = (b.innerText || b.value || '').normalize('NFC').trim().toLowerCase();
+                                if (t === 'yes' || t === 'có') {
+                                    b.click();
+                                    return true;
+                                }
+                            }
+                            return false;
+                            """
+                        )
+                    )
+                    if clicked_yes:
+                        logger.info("Đã xử lý popup 'Stay signed in?' (JS NFC fallback)")
+                        time.sleep(3.0)
                 if clicked_yes:
                     continue
 
@@ -2552,13 +2951,9 @@ def replace_hotmail_recovery_email(
                     d
                     for d in (
                         TEMPMAIL_DOMAIN,
-                        FVIA_DOMAIN,
-                        "fviadropinbox.com",
-                        "fviamail.work",
-                        "dropinboxes.com",
-                        BOXNT_DOMAIN,
-                        "tempinbox.vn",
-                        "tmpmails.net",
+                        *FVIA_DOMAINS,
+                        *BOXNT_DOMAINS,
+                        *GETNADA_DOMAINS,
                     )
                     if d != target_dom
                 ]

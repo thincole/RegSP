@@ -84,8 +84,8 @@ def parse_column_b(raw_string: str) -> Dict[str, Optional[str]]:
             # Password hotmail là phần ngay sau email
             if i + 1 < len(parts):
                 next_part = parts[i + 1].strip()
-                # Chỉ lấy nếu không phải email/cookie/token
-                if "@" not in next_part and "c_user" not in next_part and not next_part.startswith("EAA"):
+                # Chỉ lấy nếu không phải email/cookie/token (cho phép mật khẩu chứa ký tự '@' như 'OAFEZTVWRBtdw81@')
+                if not _looks_like_email(next_part) and "c_user" not in next_part and not next_part.startswith("EAA"):
                     hotmail_password = next_part
             break
 
@@ -130,7 +130,7 @@ def parse_column_b(raw_string: str) -> Dict[str, Optional[str]]:
 
     if not recovery_email:
         m_rec = re.search(
-            r"([A-Za-z0-9._%+-]+@(?:boxnt\.com|tempinbox\.vn|tmpmails\.net|fviainboxes\.com|fviadropinbox\.com|fviamail\.work|dropinboxes\.com|nguyenmaucole\.io\.vn))",
+            r"([A-Za-z0-9._%+-]+@(?:boxnt\.com|tempinbox\.vn|tmpmails\.net|fviainboxes\.com|fviadropinbox\.com|fviamail\.work|dropinboxes\.com|nguyenmaucole\.io\.vn|getnada\.com|nada\.email|nada\.ltd|inboxes\.com|blondmail\.com|chapsmail\.com|clowmail\.com|dropjar\.com|fivermail\.com|getairmail\.com|getmule\.com|gimpmail\.com|givmail\.com|guysmail\.com|inboxbear\.com|replyloop\.com|robot-mail\.com|tafmail\.com|temptami\.com|tupmail\.com|vomoto\.com))",
             raw_string,
             flags=re.IGNORECASE,
         )
