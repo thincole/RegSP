@@ -730,6 +730,8 @@ def _handle_checkpoint_956(
     new_hotmail_pass: str = "",
     recovery_domain: str = "",
     forwarding_domain: str = "",
+    allow_change_hotmail_pass: bool = False,
+    allow_change_hotmail_recovery: bool = False,
 ) -> bool:
     """
     Tự động mở khóa màn hình khóa tài khoản 'confirm this is your Meta Account to unlock it'
@@ -808,23 +810,27 @@ def _handle_checkpoint_956(
             try:
                 if driver.window_handles and fb_handle != driver.window_handles[0]:
                     driver.switch_to.window(driver.window_handles[0])
-                hot_ok = login_hotmail(driver, hotmail_email, hotmail_password, recovery_email, new_fb_pass)
+                hot_ok = login_hotmail(driver, hotmail_email, hotmail_password, recovery_email, new_hotmail_pass)
                 if hot_ok:
-                    replace_hotmail_recovery_email(
-                        driver, hotmail_email, recovery_email, hotmail_password, new_fb_pass, target_domain=rec_dom
-                    )
-                    change_hotmail_password(
-                        driver,
-                        hotmail_password,
-                        new_fb_pass,
-                        hotmail_email,
-                        f"{prefix}@{rec_dom}",
-                    )
+                    effective_rec = recovery_email
+                    if allow_change_hotmail_recovery:
+                        if replace_hotmail_recovery_email(
+                            driver, hotmail_email, recovery_email, hotmail_password, new_hotmail_pass, target_domain=rec_dom
+                        ):
+                            effective_rec = f"{prefix}@{rec_dom}"
+                    if allow_change_hotmail_pass and (new_hotmail_pass or "").strip():
+                        change_hotmail_password(
+                            driver,
+                            hotmail_password,
+                            new_hotmail_pass.strip(),
+                            hotmail_email,
+                            effective_rec,
+                        )
                     setup_hotmail_forwarding(
                         driver,
                         hotmail_email,
-                        f"{prefix}@{rec_dom}",
-                        new_fb_pass,
+                        effective_rec,
+                        new_hotmail_pass,
                         hotmail_password,
                         target_domain=fwd_dom,
                     )
@@ -1043,6 +1049,8 @@ def _import_facebook_cookie(
     new_hotmail_pass: str = "",
     recovery_domain: str = "",
     forwarding_domain: str = "",
+    allow_change_hotmail_pass: bool = False,
+    allow_change_hotmail_recovery: bool = False,
 ) -> str:
     """
     Đăng nhập Facebook bằng cách nạp trực tiếp chuỗi Cookie (cơ chế giống hệt extension 'Get Token Cookie'):
@@ -1152,7 +1160,15 @@ def _import_facebook_cookie(
     _dismiss_automated_behavior_warning(driver)
     if "828281030927956" in (driver.current_url or "").lower():
         _handle_checkpoint_956(
-            driver, hotmail_email, hotmail_password, recovery_email, new_hotmail_pass, recovery_domain, forwarding_domain
+            driver,
+            hotmail_email,
+            hotmail_password,
+            recovery_email,
+            new_hotmail_pass,
+            recovery_domain,
+            forwarding_domain,
+            allow_change_hotmail_pass=allow_change_hotmail_pass,
+            allow_change_hotmail_recovery=allow_change_hotmail_recovery,
         )
     _handle_post_2fa_prompts(driver)
 
@@ -1175,6 +1191,8 @@ def login_facebook(
     hotmail_email: str = "", hotmail_password: str = "",
     recovery_email: str = "", new_hotmail_pass: str = "",
     recovery_domain: str = "", forwarding_domain: str = "",
+    allow_change_hotmail_pass: bool = False,
+    allow_change_hotmail_recovery: bool = False,
 ) -> bool:
     """
     Đăng nhập Facebook:
@@ -1195,7 +1213,15 @@ def login_facebook(
 
         if "828281030927956" in (driver.current_url or "").lower():
             _handle_checkpoint_956(
-                driver, hotmail_email, hotmail_password, recovery_email, new_hotmail_pass, recovery_domain, forwarding_domain
+                driver,
+                hotmail_email,
+                hotmail_password,
+                recovery_email,
+                new_hotmail_pass,
+                recovery_domain,
+                forwarding_domain,
+                allow_change_hotmail_pass=allow_change_hotmail_pass,
+                allow_change_hotmail_recovery=allow_change_hotmail_recovery,
             )
 
         if _check_already_logged_in(driver):
@@ -1207,6 +1233,8 @@ def login_facebook(
             cookie_status = _import_facebook_cookie(
                 driver, fb_cookie, hotmail_email, hotmail_password, recovery_email, new_hotmail_pass,
                 recovery_domain, forwarding_domain,
+                allow_change_hotmail_pass=allow_change_hotmail_pass,
+                allow_change_hotmail_recovery=allow_change_hotmail_recovery,
             )
             if cookie_status == "SUCCESS":
                 return True
@@ -1278,7 +1306,15 @@ def login_facebook(
         _dismiss_automated_behavior_warning(driver)
         if "828281030927956" in (driver.current_url or "").lower():
             _handle_checkpoint_956(
-                driver, hotmail_email, hotmail_password, recovery_email, new_hotmail_pass, recovery_domain, forwarding_domain
+                driver,
+                hotmail_email,
+                hotmail_password,
+                recovery_email,
+                new_hotmail_pass,
+                recovery_domain,
+                forwarding_domain,
+                allow_change_hotmail_pass=allow_change_hotmail_pass,
+                allow_change_hotmail_recovery=allow_change_hotmail_recovery,
             )
 
         current_url = driver.current_url.lower()

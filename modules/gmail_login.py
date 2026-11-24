@@ -87,30 +87,199 @@ def _is_gmail_inbox_loaded(driver: WebDriver, expected_email: str = "") -> bool:
             pass
 
 
-def _dismiss_gmail_popups(driver: WebDriver) -> None:
-    """Đóng các popup giới thiệu tính năng thông minh / thông báo lần đầu vào Gmail."""
+def _dismiss_gmail_popups_in_context(driver: WebDriver) -> bool:
+    """
+    Quét và đóng các popup thông báo/giới thiệu trong frame hiện tại của Gmail
+    (vd: 'Pause mobile notifications while you're using this device' -> bấm 'No thanks',
+    thông báo Chat/Desktop, hộp thoại chào mừng...). Không bao giờ chạm hộp thoại Forwarding.
+    """
+    dismissed_label = None
+    try:
+        dismissed_label = driver.execute_script(
+            r"""
+            const norm = (s) => (s || '').normalize('NFC').replace(/[\u2018\u2019\u02bc]/g, "'").replace(/\s+/g, ' ').trim().toLowerCase();
+            const isVisible = (el) => {
+                if (!el) return false;
+                const st = getComputedStyle(el);
+                if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') === 0) return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 0 && r.height > 0;
+            };
+            const isForwardingContainer = (el) => {
+                const t = norm(el ? el.innerText : '');
+                return t.includes('forwarding') || t.includes('chuyển tiếp') || t.includes('pop/imap');
+            };
+
+            const DISMISS_EXACT = new Set([
+                'no thanks', 'no, thanks', 'không, cảm ơn', 'không cảm ơn',
+                'not now', 'để sau', 'got it', 'đã hiểu', 'dismiss', 'bỏ qua',
+                'ok', 'done', 'xong', 'close', 'đóng'
+            ]);
+            const NO_THANKS_EXACT = new Set([
+                'no thanks', 'no, thanks', 'không, cảm ơn', 'không cảm ơn', 'not now', 'để sau'
+            ]);
+            const NOTIF_PROMPT_KEYS = [
+                'pause mobile notifications',
+                'chat mobile notifications',
+                "detect if you're active",
+                'tạm dừng thông báo trên thiết bị di động',
+                'thông báo trên thiết bị di động',
+                'enable desktop notifications',
+                'bật thông báo trên máy tính'
+            ];
+
+            // 1. Ưu tiên nút 'No thanks' / 'Không, cảm ơn' (kể cả trong card nổi không có role='dialog')
+            const allBtns = Array.from(document.querySelectorAll('button, [role="button"]')).filter(isVisible);
+            for (const b of allBtns) {
+                const txt = norm(b.innerText || b.textContent || b.getAttribute('aria-label') || '');
+                if (!NO_THANKS_EXACT.has(txt)) continue;
+                const dlg = b.closest('[role="dialog"], [role="alertdialog"], .b7, .Kj-JD');
+                if (dlg && isForwardingContainer(dlg)) continue;
+                b.click();
+                return 'no_thanks:' + txt;
+            }
+
+            // 2. Nếu hiện card 'Pause mobile notifications...' mà không khớp chữ nút, bấm nút đóng (x) trong chính card đó
+            const containers = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"], div')).filter(isVisible);
+            for (const c of containers) {
+                const txt = norm(c.innerText || '');
+                if (!txt || txt.length > 600) continue;
+                if (isForwardingContainer(c)) continue;
+                if (NOTIF_PROMPT_KEYS.some(k => txt.includes(k))) {
+                    const innerBtns = Array.from(c.querySelectorAll('button, [role="button"]')).filter(isVisible);
+                    for (const b of innerBtns) {
+                        const bt = norm(b.innerText || b.textContent || '');
+                        if (DISMISS_EXACT.has(bt)) {
+                            b.click();
+                            return 'notif_btn:' + bt;
+                        }
+                    }
+                    for (const b of innerBtns) {
+                        const al = norm(b.getAttribute('aria-label') || b.getAttribute('data-tooltip') || '');
+                        if (al === 'close' || al === 'đóng' || al.includes('close') || al.includes('đóng') || norm(b.innerText) === '×' || norm(b.innerText) === 'x') {
+                            b.click();
+                            return 'notif_close:' + (al || 'x');
+                        }
+                    }
+                }
+            }
+
+            // 3. Các dialog giới thiệu Gmail tiêu chuẩn (role='dialog' / 'alertdialog'), bỏ qua dialog Forwarding
+            const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"]')).filter(isVisible);
+            for (const dlg of dialogs) {
+                if (isForwardingContainer(dlg)) continue;
+                const dBtns = Array.from(dlg.querySelectorAll('button, [role="button"]')).filter(isVisible);
+                for (const b of dBtns) {
+                    const bt = norm(b.innerText || b.textContent || '');
+                    if (DISMISS_EXACT.has(bt)) {
+                        b.click();
+                        return 'dialog_btn:' + bt;
+                    }
+                }
+                for (const b of dBtns) {
+                    const al = norm(b.getAttribute('aria-label') || '');
+                    if (al === 'close' || al === 'đóng') {
+                        b.click();
+                        return 'dialog_close:' + al;
+                    }
+                }
+            }
+            return null;
+            """
+        )
+    except Exception as e:
+        logger.debug(f"Bỏ qua lỗi quét popup Gmail trong frame hiện tại: {e}")
+        dismissed_label = None
+
+    if dismissed_label:
+        logger.info(f"✅ Đã tự động đóng popup Gmail ({dismissed_label})")
+        time.sleep(0.8)
+        return True
+    return False
+
+
+def _dismiss_gmail_popups_in_child_frames(driver: WebDriver, depth: int = 0, max_depth: int = 2) -> bool:
+    """Đệ quy quét popup trong các iframe hiển thị (Google Chat / Meet trong Gmail)."""
+    if depth >= max_depth:
+        return False
+    any_dismissed = False
+    try:
+        raw_frames = driver.find_elements(By.TAG_NAME, "iframe")
+    except Exception:
+        return False
+
+    visible_frames = []
+    for f in raw_frames:
+        try:
+            if f.is_displayed():
+                visible_frames.append(f)
+        except Exception:
+            continue
+
+    for frame in visible_frames:
+        try:
+            driver.switch_to.frame(frame)
+            if _dismiss_gmail_popups_in_context(driver):
+                any_dismissed = True
+            if _dismiss_gmail_popups_in_child_frames(driver, depth=depth + 1, max_depth=max_depth):
+                any_dismissed = True
+        except Exception:
+            pass
+        finally:
+            try:
+                driver.switch_to.parent_frame()
+            except Exception:
+                try:
+                    driver.switch_to.default_content()
+                except Exception:
+                    pass
+    return any_dismissed
+
+
+def _dismiss_gmail_popups(driver: WebDriver, wait_seconds: float = 0.0) -> bool:
+    """
+    Đóng các popup giới thiệu tính năng thông minh / thông báo Google Chat
+    ('Pause mobile notifications while you're using this device' -> 'No thanks') trên cả trang chính và các iframe.
+    """
+    any_dismissed = False
+    deadline = time.time() + max(0.0, float(wait_seconds or 0.0))
     driver.implicitly_wait(0)
     try:
-        popup_xpaths = [
-            "//div[@role='dialog']//button[normalize-space()='Got it' or normalize-space()='OK' or normalize-space()='Đã hiểu' or normalize-space()='Đóng' or normalize-space()='Next' or normalize-space()='Done']",
-            "//button[@aria-label='Close' or @aria-label='Đóng'][ancestor::div[@role='dialog']]",
-        ]
-        for xp in popup_xpaths:
-            btns = [
-                b for b in driver.find_elements(By.XPATH, xp)
-                if b.is_displayed() and "forwarding" not in (b.text or "").lower()
-            ]
-            if btns:
-                if not safe_click(btns[0], delay=1.0):
-                    driver.execute_script("arguments[0].click();", btns[0])
-                    time.sleep(1.0)
+        while True:
+            round_dismissed = False
+            try:
+                driver.switch_to.default_content()
+            except Exception:
+                pass
+
+            # Quét trên document chính (tối đa 2 lần phòng popup kế tiếp hiện ra)
+            for _ in range(2):
+                if _dismiss_gmail_popups_in_context(driver):
+                    round_dismissed = True
+                    any_dismissed = True
+                else:
+                    break
+
+            # Quét thêm trong các iframe đang hiển thị (Google Chat / Meet trong Gmail hay mở popup trong iframe)
+            if _dismiss_gmail_popups_in_child_frames(driver, depth=0, max_depth=2):
+                round_dismissed = True
+                any_dismissed = True
+
+            if round_dismissed or time.time() >= deadline:
+                break
+            time.sleep(0.6)
     except Exception:
         pass
     finally:
         try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
+        try:
             driver.implicitly_wait(5)
         except Exception:
             pass
+    return any_dismissed
 
 
 def _normalize_prompt_text(text: str) -> str:
@@ -937,7 +1106,7 @@ def login_gmail(
             driver.implicitly_wait(5)
 
         if _is_gmail_inbox_loaded(driver, gmail_clean):
-            _dismiss_gmail_popups(driver)
+            _dismiss_gmail_popups(driver, wait_seconds=1.5)
             logger.info(f"✅ Đăng nhập Gmail ({gmail_clean}) thành công từ phiên có sẵn!")
             return True
 
@@ -1059,7 +1228,7 @@ def login_gmail(
             )
 
         if _is_gmail_inbox_loaded(driver):
-            _dismiss_gmail_popups(driver)
+            _dismiss_gmail_popups(driver, wait_seconds=2.5)
             logger.info(f"✅ Đăng nhập Gmail ({gmail_clean}) thành công!")
             return True
 
@@ -2196,6 +2365,7 @@ def _enable_and_save_gmail_forwarding(
         logger.info(f"Tùy chọn chuyển tiếp tới {forward_email} đã được bật!")
 
     time.sleep(0.8)
+    _dismiss_gmail_popups(driver)
 
     # Tìm nút 'Lưu thay đổi' / 'Save Changes' ở cuối trang cài đặt Gmail
     save_btns = [
@@ -2298,10 +2468,26 @@ def setup_gmail_forwarding(
                 on_phone_verified=on_phone_verified,
             )
 
+        _dismiss_gmail_popups(driver)
         _safe_get(driver, GMAIL_FWD_SETTINGS_URL)
         wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
-        _wait_for_fwd_settings_ready(driver, timeout=15)
-        time.sleep(1.5)
+        _dismiss_gmail_popups(driver)
+        if not _wait_for_fwd_settings_ready(driver, timeout=12):
+            _dismiss_gmail_popups(driver)
+            try:
+                driver.execute_script("window.location.hash = '#settings/fwdandpop';")
+            except Exception:
+                pass
+            if not _wait_for_fwd_settings_ready(driver, timeout=6):
+                _safe_get(driver, GMAIL_FWD_SETTINGS_URL)
+                try:
+                    driver.refresh()
+                except Exception:
+                    pass
+                wait_for_page_load(driver, timeout=config.PAGE_LOAD_TIMEOUT)
+                _dismiss_gmail_popups(driver)
+                _wait_for_fwd_settings_ready(driver, timeout=12)
+        time.sleep(1.2)
         _dismiss_gmail_popups(driver)
 
         # Nếu hàng 'Chuyển tiếp bản sao của thư đến tới' đã có sẵn email @nguyenmaucole.io.vn (hoặc target_dom) -> dùng luôn & lưu cột H

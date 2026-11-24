@@ -1,3 +1,4 @@
+import queue
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -43,7 +44,7 @@ from utils.error_handler import (
 from gui.app import AutoLoginApp
 
 
-def _process_single_row(row, gui_config, selected_steps, stop_flag):
+def _process_single_row(row, gui_config, selected_steps, stop_flag, window_slot=None):
     logger = get_logger()
     if stop_flag.is_set():
         return
@@ -64,9 +65,16 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
 
     logger.info(f"Đang xử lý dòng {row_index} - Profile: {profile_name}")
 
+    want_login_hotmail = 3 in selected_steps
+    want_change_pass = bool(gui_config.get('HOTMAIL_CHANGE_PASSWORD', False))
+    want_change_recovery = bool(gui_config.get('HOTMAIL_CHANGE_RECOVERY', False))
+    validation_steps = list(selected_steps)
+    if (want_change_pass or want_change_recovery) and 3 not in validation_steps:
+        validation_steps.append(3)
+
     try:
         parsed = parse_column_b(raw_data)
-        if not validate_parsed_data(parsed, selected_steps):
+        if not validate_parsed_data(parsed, validation_steps):
             logger.error(f"Dòng {row_index} ({profile_name}): Dữ liệu không đủ cho các bước đã chọn. Bỏ qua dòng này.")
             return
     except Exception as e:
@@ -80,7 +88,7 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
     profile_id = None
     try:
         profile_id = find_profile_by_name(profile_name)
-        profile_info = start_profile(profile_id)
+        profile_info = start_profile(profile_id, window_slot=window_slot)
         driver = connect_selenium(profile_info)
     except Exception as e:
         logger.error(f"Dòng {row_index} ({profile_name}): Lỗi mở profile - {e}")
@@ -122,6 +130,8 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
                     new_hotmail_pass,
                     rec_target_domain,
                     fwd_target_domain,
+                    allow_change_hotmail_pass=bool(want_change_pass and (new_hotmail_pass or "").strip()),
+                    allow_change_hotmail_recovery=want_change_recovery,
                 )
             except BrowserClosedError:
                 raise
@@ -172,11 +182,10 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
                 return
             logger.info(f"Dòng {row_index} ({profile_name}): Login tài khoản {region} bằng Facebook thành công.")
 
-        # Bước 3: Login Hotmail -> Thay mail khôi phục (nếu chọn) -> Đổi password Hotmail
-        hot_ok = False
+        # Bước 3: Login Hotmail / Thay mail khôi phục / Đổi pass Hotmail (3 tùy chọn độc lập)
+        hot_ok = not want_login_hotmail
         recovery_email = parsed.get('recovery_email', '')
-        want_change_recovery = bool(gui_config.get('HOTMAIL_CHANGE_RECOVERY', False))
-        if (3 in selected_steps or want_change_recovery) and not stop_flag.is_set():
+        if want_login_hotmail and not stop_flag.is_set():
             check_browser_alive(driver)
             logger.info(f"Dòng {row_index} ({profile_name}): Bắt đầu Bước 3 - Login Hotmail")
             try:
@@ -198,39 +207,47 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
 
             if hot_ok:
                 logger.info(f"Dòng {row_index} ({profile_name}): Login Hotmail thành công.")
+            else:
+                logger.error(f"Dòng {row_index} ({profile_name}): Login Hotmail thất bại.")
 
-                # 3a. Thay mail khôi phục về @<rec_target_domain> TRƯỚC (cùng trang account.live.com/proofs/Manage/additional)
-                if want_change_recovery and not stop_flag.is_set():
-                    check_browser_alive(driver)
-                    logger.info(
-                        f"Dòng {row_index} ({profile_name}): Tiến hành kiểm tra / thay mail khôi phục Hotmail về @{rec_target_domain}..."
+        if hot_ok and (want_change_recovery or want_change_pass) and not stop_flag.is_set():
+            # 3a. Thay mail khôi phục về @<rec_target_domain> TRƯỚC (cùng trang account.live.com/proofs/Manage/additional)
+            if want_change_recovery and not stop_flag.is_set():
+                check_browser_alive(driver)
+                logger.info(
+                    f"Dòng {row_index} ({profile_name}): Tiến hành kiểm tra / thay mail khôi phục Hotmail về @{rec_target_domain}..."
+                )
+                try:
+                    rec_ok = replace_hotmail_recovery_email(
+                        driver,
+                        parsed['hotmail_email'],
+                        recovery_email,
+                        parsed.get('hotmail_password', ''),
+                        new_hotmail_pass,
+                        target_domain=rec_target_domain,
                     )
-                    try:
-                        rec_ok = replace_hotmail_recovery_email(
-                            driver,
-                            parsed['hotmail_email'],
-                            recovery_email,
-                            parsed.get('hotmail_password', ''),
-                            new_hotmail_pass,
-                            target_domain=rec_target_domain,
-                        )
-                    except BrowserClosedError:
-                        raise
-                    except Exception as e:
-                        if is_browser_closed_exception(e):
-                            raise BrowserClosedError(str(e)) from e
-                        logger.error(f"Dòng {row_index} ({profile_name}): Thay mail khôi phục Hotmail lỗi - {e}")
-                        rec_ok = False
+                except BrowserClosedError:
+                    raise
+                except Exception as e:
+                    if is_browser_closed_exception(e):
+                        raise BrowserClosedError(str(e)) from e
+                    logger.error(f"Dòng {row_index} ({profile_name}): Thay mail khôi phục Hotmail lỗi - {e}")
+                    rec_ok = False
 
-                    if rec_ok:
-                        email_prefix = parsed['hotmail_email'].split('@')[0].strip().lower()
-                        recovery_email = f"{email_prefix}@{rec_target_domain}"
-                        logger.info(f"Dòng {row_index} ({profile_name}): Hoàn tất kiểm tra / thay mail khôi phục Hotmail ({recovery_email}).")
-                    else:
-                        logger.error(f"Dòng {row_index} ({profile_name}): Thay mail khôi phục Hotmail thất bại.")
+                if rec_ok:
+                    email_prefix = parsed['hotmail_email'].split('@')[0].strip().lower()
+                    recovery_email = f"{email_prefix}@{rec_target_domain}"
+                    logger.info(f"Dòng {row_index} ({profile_name}): Hoàn tất kiểm tra / thay mail khôi phục Hotmail ({recovery_email}).")
+                else:
+                    logger.error(f"Dòng {row_index} ({profile_name}): Thay mail khôi phục Hotmail thất bại.")
 
-                # 3b. Đổi mật khẩu Hotmail SAU (bấm trực tiếp Change password ngay trên trang Security/Manage nếu đang mở sẵn)
-                if 3 in selected_steps and not stop_flag.is_set():
+            # 3b. Đổi mật khẩu Hotmail SAU (bấm trực tiếp Change password ngay trên trang Security/Manage nếu đang mở sẵn)
+            if want_change_pass and not stop_flag.is_set():
+                if not (new_hotmail_pass or "").strip():
+                    logger.warning(
+                        f"Dòng {row_index} ({profile_name}): Bỏ qua đổi mật khẩu Hotmail vì 'New Hotmail Password' đang để trắng."
+                    )
+                else:
                     check_browser_alive(driver)
                     logger.info(f"Dòng {row_index} ({profile_name}): Tiến hành đổi mật khẩu Hotmail...")
                     try:
@@ -249,15 +266,13 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
                         logger.info(f"Dòng {row_index} ({profile_name}): Đổi mật khẩu Hotmail thành công.")
                     else:
                         logger.error(f"Dòng {row_index} ({profile_name}): Đổi mật khẩu Hotmail thất bại.")
-            else:
-                logger.error(f"Dòng {row_index} ({profile_name}): Login Hotmail thất bại.")
 
         # Bước 4: Thêm Email forwarding (@nguyenmaucole.io.vn hoặc @fviainboxes.com)
         sheet_fwd = (row.get('forward_email') or '').strip()
         fwd_email = sheet_fwd if '@' in sheet_fwd else ''
         if 4 in selected_steps and not stop_flag.is_set():
             check_browser_alive(driver)
-            if 3 in selected_steps and not hot_ok:
+            if want_login_hotmail and not hot_ok:
                 logger.warning(f"Dòng {row_index} ({profile_name}): Bỏ qua Bước 4 (Forwarding) vì Login Hotmail thất bại.")
             else:
                 logger.info(f"Dòng {row_index} ({profile_name}): Bắt đầu Bước 4 - Thêm Email forwarding về @{fwd_target_domain}")
@@ -404,7 +419,7 @@ def _process_single_row(row, gui_config, selected_steps, stop_flag):
                 logger.error(f"Dòng {row_index} ({profile_name}): Lỗi khi đóng profile - {e}")
 
 
-def _process_single_row_gmail(row, gui_config, selected_steps, stop_flag):
+def _process_single_row_gmail(row, gui_config, selected_steps, stop_flag, window_slot=None):
     """
     Luồng xử lý 1 dòng cho Tab 'Reg Gmail' (4 bước):
       1. Login Gmail - Thêm Forwarding mail về @nguyenmaucole.io.vn (hoặc @fviainboxes.com)
@@ -447,7 +462,7 @@ def _process_single_row_gmail(row, gui_config, selected_steps, stop_flag):
     profile_id = None
     try:
         profile_id = find_profile_by_name(profile_name)
-        profile_info = start_profile(profile_id)
+        profile_info = start_profile(profile_id, window_slot=window_slot)
         driver = connect_selenium(profile_info)
     except Exception as e:
         logger.error(f"Dòng {row_index} ({profile_name}): Lỗi mở profile - {e}")
@@ -778,17 +793,28 @@ def process_all_rows(gui_config, selected_steps, stop_flag, progress_callback, l
 
     completed_count = 0
     progress_lock = threading.Lock()
+    slot_pool = queue.Queue()
+    for slot_i in range(max_threads):
+        slot_pool.put(slot_i % 4)
 
     def _worker(row_item):
         nonlocal completed_count
-        if not stop_flag.is_set():
-            if mode == "gmail":
-                _process_single_row_gmail(row_item, gui_config, selected_steps, stop_flag)
-            else:
-                _process_single_row(row_item, gui_config, selected_steps, stop_flag)
-        with progress_lock:
-            completed_count += 1
-            progress_callback(completed_count, total_rows)
+        window_slot = slot_pool.get()
+        try:
+            if not stop_flag.is_set():
+                if mode == "gmail":
+                    _process_single_row_gmail(
+                        row_item, gui_config, selected_steps, stop_flag, window_slot=window_slot
+                    )
+                else:
+                    _process_single_row(
+                        row_item, gui_config, selected_steps, stop_flag, window_slot=window_slot
+                    )
+        finally:
+            slot_pool.put(window_slot)
+            with progress_lock:
+                completed_count += 1
+                progress_callback(completed_count, total_rows)
 
     with ThreadPoolExecutor(max_workers=max_threads) as executor:
         futures = [executor.submit(_worker, row) for row in rows_data]

@@ -148,23 +148,28 @@ class AutoLoginApp:
             value="Shopee ID",
         ).pack(side=tk.LEFT, padx=6)
 
-        # Bước 3: Login Hotmail và đổi password Hotmail (+ tuỳ chọn Thay mail khôi phục về @nguyenmaucole.io.vn hoặc @fviainboxes.com)
+        # Bước 3: Tách thành 3 tùy chọn độc lập: Login Hotmail - Đổi Pass - Thay Mail khôi phục
         self.cb_vars[3] = tk.BooleanVar(value=False)
+        self.hotmail_change_pass_var = tk.BooleanVar(value=False)
         self.hotmail_change_recovery_var = tk.BooleanVar(value=False)
         self.hotmail_recovery_domain_var = tk.StringVar(value="nguyenmaucole.io.vn")
         hotmail_row_frame = ttk.Frame(tab_clone)
         hotmail_row_frame.pack(fill=tk.X, anchor=tk.W, pady=2)
         ttk.Checkbutton(
             hotmail_row_frame,
-            text="3. Login Hotmail và đổi password Hotmail",
+            text="3. Login Hotmail",
             variable=self.cb_vars[3],
         ).pack(side=tk.LEFT)
         ttk.Checkbutton(
             hotmail_row_frame,
-            text="Thay mail khôi phục về:",
+            text="Đổi Pass",
+            variable=self.hotmail_change_pass_var,
+        ).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Checkbutton(
+            hotmail_row_frame,
+            text="Thay Mail khôi phục về:",
             variable=self.hotmail_change_recovery_var,
-            command=self._on_hotmail_change_recovery,
-        ).pack(side=tk.LEFT, padx=(14, 4))
+        ).pack(side=tk.LEFT, padx=(12, 4))
         ttk.Radiobutton(
             hotmail_row_frame,
             text="@nguyenmaucole.io.vn",
@@ -415,6 +420,8 @@ class AutoLoginApp:
                 self.cb_vars[2].set(bool(settings.get("cb_shopee_login")))
             if settings.get("cb_hotmail"):
                 self.cb_vars[3].set(True)
+            if "cb_hotmail_change_pass" in settings:
+                self.hotmail_change_pass_var.set(bool(settings.get("cb_hotmail_change_pass")))
             if settings.get("cb_hotmail_change_recovery"):
                 self.hotmail_change_recovery_var.set(True)
             rec_dom = settings.get("hotmail_recovery_domain")
@@ -482,6 +489,7 @@ class AutoLoginApp:
             "cb_shopee_login": self.cb_vars[2].get(),
             "shopee_market": self.shopee_region_var.get(),
             "cb_hotmail": self.cb_vars[3].get(),
+            "cb_hotmail_change_pass": self.hotmail_change_pass_var.get(),
             "cb_hotmail_change_recovery": self.hotmail_change_recovery_var.get(),
             "hotmail_recovery_domain": self.hotmail_recovery_domain_var.get(),
             "cb_forwarding": self.cb_vars[4].get(),
@@ -524,10 +532,6 @@ class AutoLoginApp:
     def _on_fb_no_cookie_change(self):
         if self.fb_no_cookie_var.get() and not self.cb_vars[1].get():
             self.cb_vars[1].set(True)
-
-    def _on_hotmail_change_recovery(self):
-        if self.hotmail_change_recovery_var.get() and not self.cb_vars[3].get():
-            self.cb_vars[3].set(True)
 
     def get_active_mode(self) -> str:
         """Trả về 'gmail' nếu đang ở Tab 'Reg Gmail', ngược lại trả về 'clone'."""
@@ -593,6 +597,7 @@ class AutoLoginApp:
             'NEW_SHOPEE_PASSWORD': self.entry_shopee_pass.get(),
             'FB_NO_COOKIE': self.fb_no_cookie_var.get(),
             'SHOPEE_REGION': self.shopee_region_var.get(),
+            'HOTMAIL_CHANGE_PASSWORD': self.hotmail_change_pass_var.get(),
             'HOTMAIL_CHANGE_RECOVERY': self.hotmail_change_recovery_var.get(),
             'HOTMAIL_RECOVERY_DOMAIN': self.hotmail_recovery_domain_var.get(),
             'HOTMAIL_FORWARDING_DOMAIN': self.hotmail_forwarding_domain_var.get(),
@@ -623,11 +628,22 @@ class AutoLoginApp:
 
     def start_processing(self):
         selected_steps = self.get_selected_steps()
-        if not selected_steps:
+        gui_config = self.get_config()
+        has_hotmail_substep = gui_config.get('MODE') == 'clone' and (
+            gui_config.get('HOTMAIL_CHANGE_PASSWORD') or gui_config.get('HOTMAIL_CHANGE_RECOVERY')
+        )
+        if not selected_steps and not has_hotmail_substep:
             messagebox.showerror("Lỗi", "Vui lòng chọn ít nhất 1 thao tác.")
             return
-            
-        gui_config = self.get_config()
+
+        if (
+            gui_config.get('MODE') == 'clone'
+            and gui_config.get('HOTMAIL_CHANGE_PASSWORD')
+            and not (gui_config.get('NEW_HOTMAIL_PASSWORD') or '').strip()
+        ):
+            messagebox.showerror("Lỗi", "Vui lòng nhập New Hotmail Password khi chọn 'Đổi Pass'.")
+            return
+
         self._save_settings()
         
         self.btn_start.config(state=tk.DISABLED)

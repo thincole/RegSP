@@ -9,6 +9,7 @@ Endpoints (tất cả dùng GET):
 
 Tham khảo: E:\\0- Get Cookie\\getcookies.md
 """
+import ctypes
 import io
 import json
 import os
@@ -19,7 +20,7 @@ import zipfile
 import threading
 import urllib.parse
 import urllib.request
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
 
 import requests
 from selenium import webdriver
@@ -431,8 +432,115 @@ def _cleanup_gemcaptcha_extension() -> None:
         logger.debug(f"Lỗi khi dọn extension GemCaptcha: {e}")
 
 
+def get_screen_work_area() -> Tuple[int, int, int, int]:
+    """
+    Lấy vùng làm việc (trừ thanh Taskbar) của màn hình chính dạng (left, top, width, height)
+    theo đơn vị tọa độ logic của Windows để chia 4 góc trình duyệt chính xác.
+    """
+    if os.name == "nt":
+        try:
+            from ctypes import wintypes
+
+            rect = wintypes.RECT()
+            # SPI_GETWORKAREA = 0x0030
+            if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
+                w = rect.right - rect.left
+                h = rect.bottom - rect.top
+                if w >= 640 and h >= 480:
+                    return int(rect.left), int(rect.top), int(w), int(h)
+        except Exception:
+            pass
+        try:
+            u32 = ctypes.windll.user32
+            w = int(u32.GetSystemMetrics(0))
+            h = int(u32.GetSystemMetrics(1))
+            if w >= 640 and h >= 480:
+                return 0, 0, w, max(480, h - 40)
+        except Exception:
+            pass
+    return 0, 0, 1920, 1040
+
+
+def get_quadrant_window_rect(
+    slot: int,
+    work_area: Optional[Tuple[int, int, int, int]] = None,
+) -> Dict[str, int]:
+    """
+    Tính tọa độ & kích thước = 1/4 màn hình cho 4 vị trí cố định:
+      - slot 0: Góc trên - trái
+      - slot 1: Góc trên - phải
+      - slot 2: Góc dưới - trái
+      - slot 3: Góc dưới - phải
+    """
+    left, top, work_w, work_h = work_area if work_area is not None else get_screen_work_area()
+    half_w = work_w // 2
+    half_h = work_h // 2
+    idx = int(slot) % 4
+
+    col = idx % 2       # 0 = trái, 1 = phải
+    row = idx // 2      # 0 = trên, 1 = dưới
+
+    x = left + (half_w if col == 1 else 0)
+    y = top + (half_h if row == 1 else 0)
+    w = (work_w - half_w) if col == 1 else half_w
+    h = (work_h - half_h) if row == 1 else half_h
+
+    return {"slot": idx, "x": int(x), "y": int(y), "width": int(w), "height": int(h)}
+
+
+def apply_browser_window_rect(driver: webdriver.Chrome, window_rect: Dict[str, int]) -> bool:
+    """Đặt vị trí & kích thước cửa sổ Chrome về đúng góc 1/4 màn hình (kể cả nếu đang maximize)."""
+    if not window_rect:
+        return False
+    x = int(window_rect["x"])
+    y = int(window_rect["y"])
+    w = int(window_rect["width"])
+    h = int(window_rect["height"])
+    slot = window_rect.get("slot", "?")
+
+    applied = False
+    try:
+        win_info = driver.execute_cdp_cmd("Browser.getWindowForTarget", {}) or {}
+        win_id = win_info.get("windowId")
+        if win_id is not None:
+            # Đưa về trạng thái normal trước nếu profile cũ từng lưu maximized/fullscreen
+            cur_state = (win_info.get("bounds") or {}).get("windowState", "normal")
+            if cur_state != "normal":
+                driver.execute_cdp_cmd(
+                    "Browser.setWindowBounds",
+                    {"windowId": win_id, "bounds": {"windowState": "normal"}},
+                )
+            driver.execute_cdp_cmd(
+                "Browser.setWindowBounds",
+                {
+                    "windowId": win_id,
+                    "bounds": {
+                        "left": x,
+                        "top": y,
+                        "width": w,
+                        "height": h,
+                        "windowState": "normal",
+                    },
+                },
+            )
+            applied = True
+    except Exception as e:
+        logger.debug(f"CDP setWindowBounds không áp dụng được: {e}")
+
+    if not applied:
+        try:
+            driver.set_window_rect(x=x, y=y, width=w, height=h)
+            applied = True
+        except Exception as e:
+            logger.debug(f"Selenium set_window_rect lỗi: {e}")
+
+    if applied:
+        logger.info(f"Đã bố trí cửa sổ trình duyệt ở góc 1/4 (slot {slot}: x={x}, y={y}, {w}x{h})")
+    return applied
+
+
 @retry(max_retries=2, delay=3.0, exceptions=(ProfileStartError,))
-def start_profile(profile_id: str) -> Dict:
+def start_profile(profile_id: str, window_slot: Optional[int] = None) -> Dict:
     """
     Khởi động profile Gemlogin.
 
@@ -441,10 +549,20 @@ def start_profile(profile_id: str) -> Dict:
 
     Nếu profile đã mở sẵn, API trả về ngay cổng debug hiện tại.
 
+    Args:
+        profile_id: ID profile Gemlogin.
+        window_slot: Vị trí góc 1/4 màn hình (0..3); nếu truyền sẽ mở & căn cửa sổ đúng 1/4 màn hình.
+
     Returns:
-        Dict chứa remote_debugging_address và driver_path.
+        Dict chứa remote_debugging_address, driver_path và window_rect (nếu có).
     """
-    logger.info(f"Đang khởi động profile ID: {profile_id}")
+    win_rect = get_quadrant_window_rect(window_slot) if window_slot is not None else None
+    slot_info = (
+        f" [slot {win_rect['slot']}: {win_rect['width']}x{win_rect['height']} @({win_rect['x']},{win_rect['y']})]"
+        if win_rect
+        else ""
+    )
+    logger.info(f"Đang khởi động profile ID: {profile_id}{slot_info}")
 
     try:
         with _start_profile_lock:
@@ -453,8 +571,12 @@ def start_profile(profile_id: str) -> Dict:
             # Truyền đơn lẻ --disable-extensions vì Gemlogin bỏ qua addination_args nếu có khoảng trắng;
             # popup Save Password đã được tắt trực tiếp qua Default/Preferences trong _disable_save_password_popup().
             extra_args = "--disable-extensions"
+            query_parts = [f"addination_args={urllib.parse.quote(extra_args)}"]
+            if win_rect:
+                query_parts.append(f"win_pos={win_rect['x']},{win_rect['y']}")
+                query_parts.append(f"win_size={win_rect['width']},{win_rect['height']}")
             res = _api_get(
-                f"/api/profiles/start/{profile_id}?addination_args={urllib.parse.quote(extra_args)}",
+                f"/api/profiles/start/{profile_id}?{'&'.join(query_parts)}",
                 timeout=30,
             )
             time.sleep(1.5)
@@ -470,11 +592,14 @@ def start_profile(profile_id: str) -> Dict:
             raise ProfileStartError(f"Không nhận được remote_debugging_address: {res}")
 
         logger.info(f"Profile started. Debug address: {remote_address}")
-        return {
+        result = {
             "remote_debugging_address": remote_address,
             "driver_path": driver_path,
             "profile_id": profile_id,
         }
+        if win_rect:
+            result["window_rect"] = win_rect
+        return result
 
     except requests.RequestException as e:
         raise ProfileStartError(f"Lỗi khởi động profile {profile_id}: {e}")
@@ -538,12 +663,16 @@ def _ensure_driver_exists(driver_path: str) -> str:
         return ""
 
 
-def connect_selenium(profile_info: Dict) -> webdriver.Chrome:
+def connect_selenium(
+    profile_info: Dict,
+    window_rect: Optional[Dict[str, int]] = None,
+) -> webdriver.Chrome:
     """
     Kết nối Selenium tới browser profile đã mở qua debuggerAddress.
 
     Args:
-        profile_info: Dict từ start_profile(), chứa remote_debugging_address và driver_path.
+        profile_info: Dict từ start_profile(), chứa remote_debugging_address, driver_path và window_rect (nếu có).
+        window_rect: Tọa độ/kích thước cửa sổ tùy chọn ghi đè profile_info['window_rect'].
 
     Returns:
         WebDriver instance đã kết nối tới browser.
@@ -588,6 +717,10 @@ def connect_selenium(profile_info: Dict) -> webdriver.Chrome:
                 driver.switch_to.window(first_handle)
         except Exception as e:
             logger.debug(f"Không thể dọn tab thừa: {e}")
+
+        target_rect = window_rect or profile_info.get("window_rect")
+        if target_rect:
+            apply_browser_window_rect(driver, target_rect)
 
         logger.info("Kết nối Selenium thành công")
         return driver
